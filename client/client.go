@@ -21,12 +21,14 @@ package client
 // library ("sync/atomic") and its own generic client/lockmanager package.
 
 import (
+	"context"
 	"encoding/json"
 
 	userlib "github.com/cs161-staff/project2-userlib"
 	"github.com/google/uuid"
 
 	"github.com/cs161-staff/project2-starter-code/client/lockmanager"
+	"github.com/cs161-staff/project2-starter-code/client/storage"
 
 	// hex.EncodeToString(...) is useful for converting []byte to string
 
@@ -118,69 +120,100 @@ func someUsefulThings() {
 }
 
 // ---------------------------------------------------------------------
-// Storage-layer thread safety.
+// Storage access.
 //
-// userlib's Datastore/Keystore are implemented as plain, unsynchronized Go
-// maps (see project2-userlib's datastoreType/keystoreType). They were never
-// designed for concurrent access from multiple goroutines -- and Go's
-// runtime actively crashes the whole process ("fatal error: concurrent map
-// read and map write") the moment two goroutines touch a map concurrently,
-// independent of the race detector and independent of which logical keys
-// they touch. Phase 4 is the first point in SAFER-CC where operations
-// really do run concurrently against this shared storage, which surfaced
-// exactly that crash during testing.
+// SAFER's business logic does not talk to userlib's Datastore/Keystore
+// directly. Every production storage access in this file goes through the
+// datastoreGet/datastoreSet/datastoreDelete/keystoreGet/keystoreSet
+// wrappers below, and those delegate to the storage.ObjectStore /
+// storage.KeyStore abstraction (see client/storage). That indirection is
+// what lets SAFER Distributed substitute a durable, shared backend
+// (MongoDB) without touching cryptography, authenticated envelopes, UUID
+// addressing, authorization logic, Namespace/File locking, or Version and
+// Epoch behavior.
 //
-// This is a distinct concern from saferLockManager's strict 2PL: the
-// LockManager coordinates SAFER's own logical resources (namespace
-// entries, logical files) so that, e.g., two AppendToFile calls on
-// DIFFERENT files never block each other. But even two operations on
-// completely unrelated files still both end up calling into the very same
-// underlying Go map, and that raw map access itself is not safe without
-// its own, separate guard -- analogous to a real database engine's
-// storage-layer buffer-pool latches being a different mechanism from its
-// transaction manager's row/table locks. datastoreMu/keystoreMu below are
-// that guard: a Mutex around every raw Datastore access and an RWMutex
-// around Keystore accesses. DatastoreGet is NOT read-only: userlib v0.5.1
-// increments its shared bandwidth counter even when reading distinct keys,
-// so allowing concurrent Gets under RLock races on that counter. Hold the
-// datastore latch exclusively for the single raw call (including its copy
-// and accounting), not for the surrounding logical operation. These latches
-// have no TxnID, no 2PL semantics, and no participation in
-// saferLockManager whatsoever. Every production call site in this file
-// goes through the datastoreGet/datastoreSet/datastoreDelete/
-// keystoreGet/keystoreSet wrappers below instead of calling
-// userlib.Datastore*/Keystore* directly.
-var datastoreMu sync.Mutex
-var keystoreMu sync.RWMutex
+// The default backend is the legacy userlib one, so V1 behavior --
+// including the datastoreMu/keystoreMu storage-engine latches, which now
+// live inside that backend where they belong -- is exactly preserved.
+// Those latches protect userlib's unsynchronized Go maps; they are not
+// SAFER transaction semantics and must not be inherited by future
+// backends. See client/storage/userlib_store.go for the full rationale.
+var activeStorage = storage.NewUserlibStorage()
+
+// storageContext is the context SAFER's storage calls carry today.
+//
+// V1's public API takes no context, so there is nothing to propagate yet.
+// Wiring per-operation contexts (deadlines, cancellation) through the
+// public SAFER API is deliberately deferred: it changes the public
+// surface, and Phase 1 changes only where storage lives, not what SAFER
+// promises.
+func storageContext() context.Context { return context.Background() }
+
+// noteStorageFailure records a backend failure.
+//
+// The userlib backend never fails, so V1's wrapper signatures return no
+// error and the ~40 existing call sites are unchanged by Phase 1.
+// A durable backend can fail, and swallowing that silently would be
+// wrong. Until error returns are plumbed through the wrappers and their
+// call sites -- the first task of Phase 2, done against a backend that can
+// actually produce errors -- failures are surfaced here rather than
+// discarded, and are observable via lastStorageFailure for tests.
+func noteStorageFailure(op string, err error) {
+	if err == nil {
+		return
+	}
+	userlib.DebugMsg("storage backend failure in %s: %v", op, err)
+	lastStorageFailureMu.Lock()
+	defer lastStorageFailureMu.Unlock()
+	lastStorageFailureErr = fmt.Errorf("%s: %w", op, err)
+}
+
+var (
+	lastStorageFailureMu  sync.Mutex
+	lastStorageFailureErr error
+)
+
+// lastStorageFailure returns the most recent backend failure recorded by
+// noteStorageFailure, or nil. It exists so tests can assert that failures
+// are not silently dropped.
+func lastStorageFailure() error {
+	lastStorageFailureMu.Lock()
+	defer lastStorageFailureMu.Unlock()
+	return lastStorageFailureErr
+}
 
 func datastoreGet(id uuid.UUID) ([]byte, bool) {
-	datastoreMu.Lock()
-	defer datastoreMu.Unlock()
-	return userlib.DatastoreGet(id)
+	value, found, err := activeStorage.Objects.Get(storageContext(), id)
+	if err != nil {
+		noteStorageFailure("datastoreGet", err)
+		return nil, false
+	}
+	return value, found
 }
 
 func datastoreSet(id uuid.UUID, value []byte) {
-	datastoreMu.Lock()
-	defer datastoreMu.Unlock()
-	userlib.DatastoreSet(id, value)
+	if err := activeStorage.Objects.Put(storageContext(), id, value); err != nil {
+		noteStorageFailure("datastoreSet", err)
+	}
 }
 
 func datastoreDelete(id uuid.UUID) {
-	datastoreMu.Lock()
-	defer datastoreMu.Unlock()
-	userlib.DatastoreDelete(id)
+	if err := activeStorage.Objects.Delete(storageContext(), id); err != nil {
+		noteStorageFailure("datastoreDelete", err)
+	}
 }
 
 func keystoreGet(name string) (userlib.PublicKeyType, bool) {
-	keystoreMu.RLock()
-	defer keystoreMu.RUnlock()
-	return userlib.KeystoreGet(name)
+	key, found, err := activeStorage.Keys.Get(storageContext(), name)
+	if err != nil {
+		noteStorageFailure("keystoreGet", err)
+		return userlib.PublicKeyType{}, false
+	}
+	return key, found
 }
 
 func keystoreSet(name string, key userlib.PublicKeyType) error {
-	keystoreMu.Lock()
-	defer keystoreMu.Unlock()
-	return userlib.KeystoreSet(name, key)
+	return activeStorage.Keys.Put(storageContext(), name, key)
 }
 
 // ---------------------------------------------------------------------
@@ -776,9 +809,10 @@ func fireConcurrencyTestHook(tag string) {
 //     reproduces the Phase-1-audit races, for correctness comparison
 //     against a "no concurrency control" baseline.
 //
-// In both baseline strategies, datastoreMu/keystoreMu (the storage-engine
-// latches from Phase 4) remain fully active regardless -- they protect Go
-// map memory safety, not SAFER transaction semantics, and disabling them
+// In both baseline strategies, the userlib backend's storage-engine
+// latches (from Phase 4, now inside client/storage) remain fully active
+// regardless -- they protect Go map memory safety, not SAFER transaction
+// semantics, and disabling them
 // would just crash the process instead of demonstrating a logical race
 // (see docs/concurrency-control.md, "Storage-layer thread safety").
 //
