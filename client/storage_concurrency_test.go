@@ -22,7 +22,7 @@ var _ = Describe("Storage concurrency", func() {
 		keys := make([]uuid.UUID, workers)
 		for i := range keys {
 			keys[i] = uuid.New()
-			if err := datastoreSet(keys[i], value); err != nil {
+			if err := datastoreSet(testCtx(), keys[i], value); err != nil {
 				Expect(err).ToNot(HaveOccurred())
 			}
 		}
@@ -38,7 +38,7 @@ var _ = Describe("Storage concurrency", func() {
 				<-start
 				valid[i] = true
 				for n := 0; n < readsPerWorker; n++ {
-					got, ok, err := datastoreGet(keys[i])
+					got, ok, err := datastoreGet(testCtx(), keys[i])
 					if err != nil || !ok || !bytes.Equal(got, value) {
 						valid[i] = false
 					}

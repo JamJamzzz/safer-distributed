@@ -70,9 +70,9 @@ var _ = Describe("Phase 4: Strict 2PL core file-content concurrency", func() {
 			Expect(strings.Count(string(content), marker)).To(Equal(1), "marker %s should appear exactly once", marker)
 		}
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
-		metadata, err := loadMetadata(accessBox)
+		metadata, err := loadMetadata(testCtx(), accessBox)
 		Expect(err).To(BeNil())
 		Expect(metadata.ChunkCount).To(Equal(uint64(1 + n)))
 		Expect(metadata.Version).To(Equal(uint64(1 + n)))
@@ -124,9 +124,9 @@ var _ = Describe("Phase 4: Strict 2PL core file-content concurrency", func() {
 		Expect(string(content)).To(ContainSubstring("-A"))
 		Expect(string(content)).To(ContainSubstring("-B"))
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
-		metadata, err := loadMetadata(accessBox)
+		metadata, err := loadMetadata(testCtx(), accessBox)
 		Expect(err).To(BeNil())
 		Expect(metadata.Version).To(Equal(uint64(3))) // base=1, +A=2, +B=3
 		Expect(metadata.ChunkCount).To(Equal(uint64(3)))
@@ -187,7 +187,7 @@ var _ = Describe("Phase 4: Strict 2PL core file-content concurrency", func() {
 		Expect(err).To(BeNil())
 		Expect(alice.StoreFile("file1.txt", []byte("OLD-CONTENT"))).To(BeNil())
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 		hookTag := "overwrite:metadata-loaded:" + accessBox.FileID.String()
 
@@ -243,9 +243,9 @@ var _ = Describe("Phase 4: Strict 2PL core file-content concurrency", func() {
 			Expect(err).To(BeNil())
 			Expect(alice.StoreFile("file1.txt", []byte("base"))).To(BeNil())
 
-			_, accessBox, err := resolveFile(alice, "file1.txt")
+			_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 			Expect(err).To(BeNil())
-			initialMetadata, err := loadMetadata(accessBox)
+			initialMetadata, err := loadMetadata(testCtx(), accessBox)
 			Expect(err).To(BeNil())
 
 			var wg sync.WaitGroup
@@ -269,9 +269,9 @@ var _ = Describe("Phase 4: Strict 2PL core file-content concurrency", func() {
 			Expect(string(finalContent)).To(SatisfyAny(Equal("NEW"), Equal("NEW+A")),
 				fmt.Sprintf("iteration %d: illegal final content %q", iter, finalContent))
 
-			_, accessBox2, err := resolveFile(alice, "file1.txt")
+			_, accessBox2, err := resolveFile(testCtx(), alice, "file1.txt")
 			Expect(err).To(BeNil())
-			finalMetadata, err := loadMetadata(accessBox2)
+			finalMetadata, err := loadMetadata(testCtx(), accessBox2)
 			Expect(err).To(BeNil())
 			Expect(finalMetadata.Version).To(Equal(initialMetadata.Version + 2))
 		}
@@ -310,9 +310,9 @@ var _ = Describe("Phase 4: Strict 2PL core file-content concurrency", func() {
 		}
 		Expect(matched).To(BeTrue(), fmt.Sprintf("final content %q should equal exactly one of the raced payloads", finalContent))
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
-		metadata, err := loadMetadata(accessBox)
+		metadata, err := loadMetadata(testCtx(), accessBox)
 		Expect(err).To(BeNil())
 		Expect(metadata.Version).To(Equal(uint64(1 + n))) // 1 (create) + n overwrites
 		Expect(metadata.ChunkCount).To(Equal(uint64(1)))
@@ -338,11 +338,11 @@ var _ = Describe("Phase 4: Strict 2PL core file-content concurrency", func() {
 			Expect(storeErr).To(BeNil(), fmt.Sprintf("StoreFile %d failed", i))
 		}
 
-		namespaceEntry, accessBox, err := resolveFile(alice, "newfile.txt")
+		namespaceEntry, accessBox, err := resolveFile(testCtx(), alice, "newfile.txt")
 		Expect(err).To(BeNil())
 		Expect(namespaceEntry.FileID).ToNot(Equal(uuid.Nil))
 
-		metadata, err := loadMetadata(accessBox)
+		metadata, err := loadMetadata(testCtx(), accessBox)
 		Expect(err).To(BeNil())
 		Expect(metadata.Version).To(Equal(uint64(n))) // first call creates (V1), remaining n-1 overwrite
 		Expect(metadata.ChunkCount).To(Equal(uint64(1)))
@@ -450,7 +450,7 @@ var _ = Describe("Phase 4: Strict 2PL core file-content concurrency", func() {
 		Expect(err).To(BeNil())
 		Expect(alice.StoreFile("file1.txt", []byte("hello"))).To(BeNil())
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 
 		// Corrupt the owner AccessBox in place so that, on the next access,
@@ -458,7 +458,7 @@ var _ = Describe("Phase 4: Strict 2PL core file-content concurrency", func() {
 		// the Namespace and File locks for that operation have already
 		// been acquired by AppendToFile. This exercises the deferred
 		// guard.ReleaseAll() error path through real SAFER code.
-		namespaceEntry, err := loadNamespaceEntry(alice, "file1.txt")
+		namespaceEntry, err := loadNamespaceEntry(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 		userlib.DatastoreSet(namespaceEntry.AccessBoxUUID, []byte("corrupted-not-a-valid-envelope"))
 

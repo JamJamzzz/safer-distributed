@@ -34,6 +34,8 @@ type FileMetadataSnapshot struct {
 // namespace entry, then Shared on the file, released only when the
 // transaction ends -- so a snapshot is never taken mid-mutation.
 func (userdata *User) ReadFileMetadata(filename string) (FileMetadataSnapshot, error) {
+	ctx := operationContext()
+
 	txn, err := allocateTxnID()
 	if err != nil {
 		return FileMetadataSnapshot{}, err
@@ -53,7 +55,7 @@ func (userdata *User) ReadFileMetadata(filename string) (FileMetadataSnapshot, e
 		return FileMetadataSnapshot{}, err
 	}
 
-	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	namespaceEntry, err := loadNamespaceEntry(ctx, userdata, filename)
 	if err != nil {
 		return FileMetadataSnapshot{}, err
 	}
@@ -63,12 +65,12 @@ func (userdata *User) ReadFileMetadata(filename string) (FileMetadataSnapshot, e
 		return FileMetadataSnapshot{}, err
 	}
 
-	accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	accessBox, err := validateFileAccessUnderLock(ctx, namespaceEntry)
 	if err != nil {
 		return FileMetadataSnapshot{}, err
 	}
 
-	metadata, err := loadMetadata(accessBox)
+	metadata, err := loadMetadata(ctx, accessBox)
 	if err != nil {
 		return FileMetadataSnapshot{}, err
 	}

@@ -124,10 +124,10 @@ var _ = Describe("Client Unit Tests", func() {
 	Describe("Phase 3: File Content Versioning", func() {
 
 		getOwnerMetadata := func(user *User, filename string) Metadata {
-			_, accessBox, err := resolveFile(user, filename)
+			_, accessBox, err := resolveFile(testCtx(), user, filename)
 			Expect(err).To(BeNil())
 
-			metadata, err := loadMetadata(accessBox)
+			metadata, err := loadMetadata(testCtx(), accessBox)
 			Expect(err).To(BeNil())
 
 			return metadata
@@ -281,10 +281,10 @@ var _ = Describe("Client Unit Tests", func() {
 
 			Expect(alice.StoreFile("file1.txt", []byte("A"))).To(BeNil())
 
-			_, accessBox, err := resolveFile(alice, "file1.txt")
+			_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 			Expect(err).To(BeNil())
 
-			metadata, err := loadMetadata(accessBox)
+			metadata, err := loadMetadata(testCtx(), accessBox)
 			Expect(err).To(BeNil())
 
 			// Directly force the persisted metadata to the maximum
@@ -317,11 +317,11 @@ var _ = Describe("Client Unit Tests", func() {
 			Expect(alice.StoreFile("file1.txt", []byte("A"))).To(BeNil())
 			Expect(alice.AppendToFile("file1.txt", []byte("B"))).To(BeNil())
 
-			_, accessBox, err := resolveFile(alice, "file1.txt")
+			_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 			Expect(err).To(BeNil())
 
 			var reloaded Metadata
-			err = loadDatastoreObject(
+			err = loadDatastoreObject(testCtx(), 
 				metadataObjectType,
 				accessBox.MetadataUUID,
 				accessBox.MetadataEncKey,

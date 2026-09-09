@@ -81,9 +81,9 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 			Expect(err).To(BeNil(), fmt.Sprintf("CreateInvitation for %s failed", recipients[i]))
 		}
 
-		namespaceEntry, accessBox, err := resolveFile(alice, "file1.txt")
+		namespaceEntry, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
-		structure, err := loadOwnerAccessBoxStructure(namespaceEntry, accessBox)
+		structure, err := loadOwnerAccessBoxStructure(testCtx(), namespaceEntry, accessBox)
 		Expect(err).To(BeNil())
 		Expect(structure.RecipientBoxes).To(HaveLen(n))
 		for _, name := range recipients {
@@ -103,7 +103,7 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		Expect(err).To(BeNil())
 		Expect(alice.StoreFile("file1.txt", []byte("hello"))).To(BeNil())
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 		hookTag := "create-invitation:structure-loaded:" + accessBox.FileID.String()
 
@@ -143,9 +143,9 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		Expect(errBob).To(BeNil())
 		Expect(errCarol).To(BeNil())
 
-		namespaceEntry, accessBox2, err := resolveFile(alice, "file1.txt")
+		namespaceEntry, accessBox2, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
-		structure, err := loadOwnerAccessBoxStructure(namespaceEntry, accessBox2)
+		structure, err := loadOwnerAccessBoxStructure(testCtx(), namespaceEntry, accessBox2)
 		Expect(err).To(BeNil())
 		_, bobTracked := structure.RecipientBoxes["bob"]
 		_, carolTracked := structure.RecipientBoxes["carol"]
@@ -163,7 +163,7 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		invite, err := alice.CreateInvitation("file1.txt", "bob")
 		Expect(err).To(BeNil())
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 		hookTag := "accept:validated:" + accessBox.FileID.String()
 
@@ -221,7 +221,7 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		invite, err := alice.CreateInvitation("file1.txt", "bob")
 		Expect(err).To(BeNil())
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 		hookTag := "revoke:content-loaded:" + accessBox.FileID.String()
 
@@ -330,7 +330,7 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		Expect(err).To(BeNil())
 		Expect(bob.AcceptInvitation("alice", invite, "shared.txt")).To(BeNil())
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 		hookTag := "revoke:content-loaded:" + accessBox.FileID.String()
 
@@ -435,7 +435,7 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		Expect(err).To(BeNil())
 		Expect(bob.AcceptInvitation("alice", invite, "shared.txt")).To(BeNil())
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 		hookTag := "revoke:content-loaded:" + accessBox.FileID.String()
 
@@ -491,7 +491,7 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		_, err = alice.CreateInvitation("file1.txt", "bob")
 		Expect(err).To(BeNil())
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 		revokeHookTag := "revoke:content-loaded:" + accessBox.FileID.String()
 
@@ -528,9 +528,9 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		Expect(revokeErr).To(BeNil())
 		Expect(inviteErr).To(BeNil())
 
-		namespaceEntry, accessBox2, err := resolveFile(alice, "file1.txt")
+		namespaceEntry, accessBox2, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
-		structure, err := loadOwnerAccessBoxStructure(namespaceEntry, accessBox2)
+		structure, err := loadOwnerAccessBoxStructure(testCtx(), namespaceEntry, accessBox2)
 		Expect(err).To(BeNil())
 
 		_, bobTracked := structure.RecipientBoxes["bob"]
@@ -552,7 +552,7 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		_, err = alice.CreateInvitation("file1.txt", "bob")
 		Expect(err).To(BeNil())
 
-		_, accessBox, err := resolveFile(alice, "file1.txt")
+		_, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
 		inviteHookTag := "create-invitation:structure-loaded:" + accessBox.FileID.String()
 
@@ -589,9 +589,9 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		Expect(inviteErr).To(BeNil())
 		Expect(revokeErr).To(BeNil())
 
-		namespaceEntry, accessBox2, err := resolveFile(alice, "file1.txt")
+		namespaceEntry, accessBox2, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
-		structure, err := loadOwnerAccessBoxStructure(namespaceEntry, accessBox2)
+		structure, err := loadOwnerAccessBoxStructure(testCtx(), namespaceEntry, accessBox2)
 		Expect(err).To(BeNil())
 
 		_, bobTracked := structure.RecipientBoxes["bob"]
@@ -631,9 +631,9 @@ var _ = Describe("Phase 5: Strict 2PL sharing/revocation concurrency", func() {
 		Expect(revokeBobErr).To(BeNil())
 		Expect(revokeCarolErr).To(BeNil())
 
-		namespaceEntry, accessBox, err := resolveFile(alice, "file1.txt")
+		namespaceEntry, accessBox, err := resolveFile(testCtx(), alice, "file1.txt")
 		Expect(err).To(BeNil())
-		structure, err := loadOwnerAccessBoxStructure(namespaceEntry, accessBox)
+		structure, err := loadOwnerAccessBoxStructure(testCtx(), namespaceEntry, accessBox)
 		Expect(err).To(BeNil())
 
 		_, bobTracked := structure.RecipientBoxes["bob"]

@@ -71,15 +71,15 @@ var _ = Describe("Storage abstraction", func() {
 
 		id := uuid.New()
 		value := []byte("envelope-bytes")
-		Expect(datastoreSet(id, value)).To(Succeed())
+		Expect(datastoreSet(testCtx(), id, value)).To(Succeed())
 
-		got, exists, err := datastoreGet(id)
+		got, exists, err := datastoreGet(testCtx(), id)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(exists).To(BeTrue())
 		Expect(got).To(Equal(value))
 
-		Expect(datastoreDelete(id)).To(Succeed())
-		_, exists, err = datastoreGet(id)
+		Expect(datastoreDelete(testCtx(), id)).To(Succeed())
+		_, exists, err = datastoreGet(testCtx(), id)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(exists).To(BeFalse())
 	})
@@ -89,13 +89,13 @@ var _ = Describe("Storage abstraction", func() {
 		// treats absence as a meaningful answer, so an outage would
 		// otherwise read as "this file does not exist".
 		withStorage(storage.Storage{Objects: failingObjectStore{}, Keys: failingKeyStore{}}, func() {
-			_, _, err := datastoreGet(uuid.New())
+			_, _, err := datastoreGet(testCtx(), uuid.New())
 			Expect(err).To(MatchError(errBackendDown))
 
-			Expect(datastoreSet(uuid.New(), []byte("x"))).To(MatchError(errBackendDown))
-			Expect(datastoreDelete(uuid.New())).To(MatchError(errBackendDown))
+			Expect(datastoreSet(testCtx(), uuid.New(), []byte("x"))).To(MatchError(errBackendDown))
+			Expect(datastoreDelete(testCtx(), uuid.New())).To(MatchError(errBackendDown))
 
-			_, _, err = keystoreGet("some-key-name")
+			_, _, err = keystoreGet(testCtx(), "some-key-name")
 			Expect(err).To(MatchError(errBackendDown))
 		})
 	})
@@ -113,7 +113,13 @@ var _ = Describe("Storage abstraction", func() {
 		// keystoreSet already returned an error in V1, so this path loses
 		// nothing: SAFER sees the backend failure directly.
 		withStorage(storage.Storage{Objects: failingObjectStore{}, Keys: failingKeyStore{}}, func() {
-			Expect(keystoreSet("some-key-name", userlib.PublicKeyType{})).To(MatchError(errBackendDown))
+			Expect(keystoreSet(testCtx(), "some-key-name", userlib.PublicKeyType{})).To(MatchError(errBackendDown))
 		})
 	})
 })
+
+// testCtx is the context white-box tests pass to internal helpers that
+// now take one. Tests exercise SAFER's logic, not its transaction
+// plumbing, so a plain background context is the right default; the
+// rollback tests that do care use a transactional one explicitly.
+func testCtx() context.Context { return context.Background() }

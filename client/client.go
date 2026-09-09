@@ -179,14 +179,22 @@ func UseUserlibStorage() (restore func()) {
 	return UseStorage(storage.NewUserlibStorage())
 }
 
-// storageContext is the context SAFER's storage calls carry today.
+// operationContext is the context one public SAFER operation runs under.
 //
-// V1's public API takes no context, so there is nothing to propagate yet.
-// Wiring per-operation contexts (deadlines, cancellation) through the
-// public SAFER API is deliberately deferred: it changes the public
-// surface, and Phase 1 changes only where storage lives, not what SAFER
-// promises.
-func storageContext() context.Context { return context.Background() }
+// Every storage call an operation makes takes a context, and they all
+// descend from this one. That is what lets a MongoDB transaction be scoped
+// to exactly one operation: RunAtomic derives a session-carrying context
+// from it, and the storage calls made with that derived context join the
+// transaction. Nothing about the current transaction lives in a global,
+// in goroutine identity, or in a swapped-out backend -- an operation's
+// transaction is reachable only through the context value it passes down
+// its own call stack, so concurrent operations cannot see or disturb each
+// other's.
+//
+// V1's public API takes no context, so today this is just Background().
+// The plumbing is what matters: the same parameter carries cancellation
+// and deadlines, and tracing later, without another refactor.
+func operationContext() context.Context { return context.Background() }
 
 // The wrappers below return backend errors to their callers.
 //
@@ -201,24 +209,24 @@ func storageContext() context.Context { return context.Background() }
 // context, so there is nothing to propagate yet. Threading per-operation
 // deadlines through the public SAFER API would change that API and is not
 // part of this change.
-func datastoreGet(id uuid.UUID) ([]byte, bool, error) {
-	return currentStorage().Objects.Get(storageContext(), id)
+func datastoreGet(ctx context.Context, id uuid.UUID) ([]byte, bool, error) {
+	return currentStorage().Objects.Get(ctx, id)
 }
 
-func datastoreSet(id uuid.UUID, value []byte) error {
-	return currentStorage().Objects.Put(storageContext(), id, value)
+func datastoreSet(ctx context.Context, id uuid.UUID, value []byte) error {
+	return currentStorage().Objects.Put(ctx, id, value)
 }
 
-func datastoreDelete(id uuid.UUID) error {
-	return currentStorage().Objects.Delete(storageContext(), id)
+func datastoreDelete(ctx context.Context, id uuid.UUID) error {
+	return currentStorage().Objects.Delete(ctx, id)
 }
 
-func keystoreGet(name string) (userlib.PublicKeyType, bool, error) {
-	return currentStorage().Keys.Get(storageContext(), name)
+func keystoreGet(ctx context.Context, name string) (userlib.PublicKeyType, bool, error) {
+	return currentStorage().Keys.Get(ctx, name)
 }
 
-func keystoreSet(name string, key userlib.PublicKeyType) error {
-	return currentStorage().Keys.Put(storageContext(), name, key)
+func keystoreSet(ctx context.Context, name string, key userlib.PublicKeyType) error {
+	return currentStorage().Keys.Put(ctx, name, key)
 }
 
 // ---------------------------------------------------------------------
@@ -287,16 +295,16 @@ func getVerifyKeyName(username string) string {
 //A storage failure is reported as an error rather than as "not taken":
 //treating an unreachable backend as a free username would let a second
 //account overwrite an existing one.
-func isUsernameTaken(username string, accountUUID uuid.UUID) (bool, error) {
-	_, accountExists, err := datastoreGet(accountUUID)
+func isUsernameTaken(ctx context.Context, username string, accountUUID uuid.UUID) (bool, error) {
+	_, accountExists, err := datastoreGet(ctx, accountUUID)
 	if err != nil {
 		return false, err
 	}
-	_, pkeExists, err := keystoreGet(getPKEKeyName(username))
+	_, pkeExists, err := keystoreGet(ctx, getPKEKeyName(username))
 	if err != nil {
 		return false, err
 	}
-	_, verifyExists, err := keystoreGet(getVerifyKeyName(username))
+	_, verifyExists, err := keystoreGet(ctx, getVerifyKeyName(username))
 	if err != nil {
 		return false, err
 	}
@@ -383,6 +391,7 @@ func emacAccount(
 // NOTE: The following methods have toy (insecure!) implementations.
 
 func InitUser(username string, password string) (userdataptr *User, err error) {
+	ctx := operationContext()
 	if username == "" {
 		return nil, errors.New("username cannot be empty")
 	}
@@ -393,7 +402,7 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 		return nil, err
 	}
 
-	taken, err := isUsernameTaken(username, accountUUID)
+	taken, err := isUsernameTaken(ctx, username, accountUUID)
 	if err != nil {
 		return nil, err
 	}
@@ -446,7 +455,7 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	//Store the key for dec
-	err = keystoreSet(
+	err = keystoreSet(ctx, 
 		getPKEKeyName(username),
 		pkePulic,
 	)
@@ -456,7 +465,7 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	//Store the key for verify the d.s.
-	err = keystoreSet(
+	err = keystoreSet(ctx, 
 		getVerifyKeyName(username),
 		verifyPublic,
 	)
@@ -466,7 +475,7 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	//Store the emac account to datastore
-	if err := datastoreSet(accountUUID, encAccount); err != nil {
+	if err := datastoreSet(ctx, accountUUID, encAccount); err != nil {
 		return nil, err
 	}
 
@@ -544,6 +553,7 @@ func openAccount(
 }
 
 func GetUser(username string, password string) (userdataptr *User, err error) {
+	ctx := operationContext()
 	if username == "" {
 		return nil, errors.New("username cant be empty")
 	}
@@ -554,7 +564,7 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
     }
 
 	//Get the envelope
-	envelopeBytes, exists, err := datastoreGet(accountUUID)
+	envelopeBytes, exists, err := datastoreGet(ctx, accountUUID)
 
 	if err != nil {
 		return nil, err
@@ -1260,6 +1270,7 @@ func createFileStatus (
 // acquired is guaranteed to match the FileID this function actually
 // publishes.
 func (userdata *User) storeNewFileLocked(
+	ctx context.Context,
 	filename string,
 	content []byte,
 	fileID uuid.UUID,
@@ -1436,42 +1447,42 @@ func (userdata *User) storeNewFileLocked(
     	return err
 	}
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
 		baseChunkUUID,
 		protectedChunk,
 	); err != nil {
 		return err
 	}
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
 		metadataUUID,
 		protectedMetadata,
 	); err != nil {
 		return err
 	}
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
 		ownerAccessBoxUUID,
 		protectedAccessBox,
 	); err != nil {
 		return err
 	}
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
 		statusUUID,
 		fileStatusBytes,
 	); err != nil {
 		return err
 	}
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
 		structureUUID,
 		protectedAccessBoxStructure,
 	); err != nil {
 		return err
 	}
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
 		nameUUID,
 		protectedNamespaceEntry,
 	); err != nil {
@@ -1493,10 +1504,11 @@ If the file already exists, we rewrite the file
 // function performs no locking and no access-control revalidation of its
 // own; it assumes both are already established and still held.
 func overwriteExistingFileLocked(
+	ctx context.Context,
 	accessBox AccessBox,
 	content []byte,
 ) error {
-	metadata, err := loadMetadata(accessBox)
+	metadata, err := loadMetadata(ctx, accessBox)
     if err != nil {
         return err
     }
@@ -1504,7 +1516,7 @@ func overwriteExistingFileLocked(
 	fireConcurrencyTestHook("overwrite:metadata-loaded:" + accessBox.FileID.String())
 
 	_, oldChunkUUIDs, err :=
-        loadFileContentAndChunkUUIDs(
+        loadFileContentAndChunkUUIDs(ctx, 
             accessBox,
             metadata,
         )
@@ -1581,21 +1593,21 @@ func overwriteExistingFileLocked(
     }
 
 	//Set the new chunk and new metadata
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
         newBaseChunkUUID,
         protectedNewChunk,
     ); err != nil {
 		return err
 	}
 
-    if err := datastoreSet(
+    if err := datastoreSet(ctx, 
         accessBox.MetadataUUID,
         protectedNewMetadata,
     ); err != nil {
     	return err
     }
 	for _, oldChunkUUID := range oldChunkUUIDs {
-        if err := datastoreDelete(oldChunkUUID); err != nil {
+        if err := datastoreDelete(ctx, oldChunkUUID); err != nil {
         	return err
         }
     }
@@ -1618,6 +1630,7 @@ func overwriteExistingFileLocked(
 // guard.ReleaseAll(), deferred immediately after the guard is created, so
 // every return path (success or error) releases them.
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {
+	ctx := operationContext()
 	txn, err := allocateTxnID()
 	if err != nil {
 		return err
@@ -1647,14 +1660,14 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
         return err
     }
 
-	_, exists, err := datastoreGet(nameUUID)
+	_, exists, err := datastoreGet(ctx, nameUUID)
 
 	if err != nil {
 		return err
 	}
 
 	if exists {
-		namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+		namespaceEntry, err := loadNamespaceEntry(ctx, userdata, filename)
 		if err != nil {
 			return err
 		}
@@ -1664,12 +1677,12 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 			return err
 		}
 
-		accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+		accessBox, err := validateFileAccessUnderLock(ctx, namespaceEntry)
 		if err != nil {
 			return err
 		}
 
-		return overwriteExistingFileLocked(accessBox, content)
+		return overwriteExistingFileLocked(ctx, accessBox, content)
 	}
 
 	fileID := uuid.New()
@@ -1679,7 +1692,7 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		return err
 	}
 
-	return userdata.storeNewFileLocked(filename, content, fileID)
+	return userdata.storeNewFileLocked(ctx, filename, content, fileID)
 }
 
 // AppendToFile is the strict-2PL transaction boundary for content append.
@@ -1693,6 +1706,7 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 // lost-update race described in the Phase 1 audit and Phase 3's
 // documented limitation.
 func (userdata *User) AppendToFile(filename string, content []byte) error {
+	ctx := operationContext()
 	txn, err := allocateTxnID()
 	if err != nil {
 		return err
@@ -1713,7 +1727,7 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 		return err
 	}
 
-	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	namespaceEntry, err := loadNamespaceEntry(ctx, userdata, filename)
 	if err != nil {
 		return err
 	}
@@ -1723,14 +1737,14 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 		return err
 	}
 
-	accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	accessBox, err := validateFileAccessUnderLock(ctx, namespaceEntry)
 	if err != nil {
 		return err
 	}
 
 	// Metadata is deliberately (re)loaded here, strictly after File X was
 	// granted above -- never reuse a Metadata value read before this line.
-	metadata, err := loadMetadata(accessBox)
+	metadata, err := loadMetadata(ctx, accessBox)
 	if err != nil {
 		return err
 	}
@@ -1807,14 +1821,14 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
         return err
     }
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
         newChunkUUID,
         protectedNewChunk,
     ); err != nil {
 		return err
 	}
 
-    if err := datastoreSet(
+    if err := datastoreSet(ctx, 
         accessBox.MetadataUUID,
         protectedUpdatedMetadata,
     ); err != nil {
@@ -1828,6 +1842,7 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 Helper func for loadFile
 **/
 func loadDatastoreObject(
+	ctx context.Context,
 	objectType string,
 	objectUUID uuid.UUID,
 	encKey []byte,
@@ -1847,7 +1862,7 @@ func loadDatastoreObject(
         return errors.New("invalid object keys")
     }
 
-    envelopeBytes, exists, err := datastoreGet(objectUUID)
+    envelopeBytes, exists, err := datastoreGet(ctx, objectUUID)
     if err != nil {
         return err
     }
@@ -1899,13 +1914,14 @@ func loadDatastoreObject(
 }
 
 func verifyFileStatus(
+	ctx context.Context,
 	accessBox AccessBox,
 ) error {
 	if accessBox.StatusUUID == uuid.Nil {
 		return errors.New("invalid status uuid")
 	}
 
-	statusBytes, exists, err := datastoreGet(
+	statusBytes, exists, err := datastoreGet(ctx, 
 		accessBox.StatusUUID,
 	)
 
@@ -1924,7 +1940,7 @@ func verifyFileStatus(
         return errors.New("invalid file status")
     }
 
-	verifyKey, exists, err := keystoreGet(
+	verifyKey, exists, err := keystoreGet(ctx, 
 		accessBox.OwnerVerifyKeyName,
 	)
 
@@ -2001,7 +2017,7 @@ func verifyFileStatus(
 // it is not yet safe to trust its AccessBoxUUID/keys as "the current
 // capability," because a concurrent RevokeAccess could rotate them before
 // (or, without a file lock, even while) the caller acts on them.
-func loadNamespaceEntry(userdata *User, filename string) (NamespaceEntry, error) {
+func loadNamespaceEntry(ctx context.Context, userdata *User, filename string) (NamespaceEntry, error) {
 	var emptyEntry NamespaceEntry
 
 	if userdata == nil {
@@ -2028,7 +2044,7 @@ func loadNamespaceEntry(userdata *User, filename string) (NamespaceEntry, error)
 	var namespaceEntry NamespaceEntry
 
 	//Get the namespaceEntry
-	err = loadDatastoreObject(
+	err = loadDatastoreObject(ctx, 
 		namespaceEntryObjectType,
 		nameUUID,
 		namespaceEncKey,
@@ -2070,11 +2086,11 @@ func loadNamespaceEntry(userdata *User, filename string) (NamespaceEntry, error)
 // RevokeAccess can commit while this read is in progress -- this is what
 // eliminates the TOCTOU race between validation and use that the
 // unlocked, single-shot resolveFile could not close on its own.
-func validateFileAccessUnderLock(namespaceEntry NamespaceEntry) (AccessBox, error) {
+func validateFileAccessUnderLock(ctx context.Context, namespaceEntry NamespaceEntry) (AccessBox, error) {
 	var emptyAccessBox AccessBox
 	var accessBox AccessBox
 
-	err := loadDatastoreObject(
+	err := loadDatastoreObject(ctx, 
 		accessBoxObjectType,
 		namespaceEntry.AccessBoxUUID,
 		namespaceEntry.AccessBoxEncKey,
@@ -2118,7 +2134,7 @@ func validateFileAccessUnderLock(namespaceEntry NamespaceEntry) (AccessBox, erro
 		return emptyAccessBox, errors.New("missing owner verification key name")
 	}
 
-	err = verifyFileStatus(accessBox)
+	err = verifyFileStatus(ctx, accessBox)
 	if err != nil {
 		return emptyAccessBox, err
 	}
@@ -2140,11 +2156,11 @@ func validateFileAccessUnderLock(namespaceEntry NamespaceEntry) (AccessBox, erro
 // shared file state). Under that contract, a RevokeAccess that already
 // committed is guaranteed visible here, and (since RevokeAccess also takes
 // File X) none can commit while this read is in flight.
-func validateInvitationAccessUnderLock(payload InvitationPayload) (AccessBox, error) {
+func validateInvitationAccessUnderLock(ctx context.Context, payload InvitationPayload) (AccessBox, error) {
 	var emptyAccessBox AccessBox
 	var accessBox AccessBox
 
-	err := loadDatastoreObject(
+	err := loadDatastoreObject(ctx, 
 		accessBoxObjectType,
 		payload.AccessBoxUUID,
 		payload.AccessBoxEncKey,
@@ -2159,7 +2175,7 @@ func validateInvitationAccessUnderLock(payload InvitationPayload) (AccessBox, er
 		return emptyAccessBox, errors.New("invitation and AccessBox FileID mismatch")
 	}
 
-	err = verifyFileStatus(accessBox)
+	err = verifyFileStatus(ctx, accessBox)
 	if err != nil {
 		return emptyAccessBox, err
 	}
@@ -2180,6 +2196,7 @@ func validateInvitationAccessUnderLock(payload InvitationPayload) (AccessBox, er
 // between, exactly as StoreFile/AppendToFile/LoadFile/CreateInvitation/
 // AcceptInvitation/RevokeAccess all now do.
 func resolveFile(
+	ctx context.Context,
 	userdata *User,
 	filename string,
 ) (
@@ -2187,12 +2204,12 @@ func resolveFile(
 	AccessBox,
 	error,
 ) {
-	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	namespaceEntry, err := loadNamespaceEntry(ctx, userdata, filename)
 	if err != nil {
 		return NamespaceEntry{}, AccessBox{}, err
 	}
 
-	accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	accessBox, err := validateFileAccessUnderLock(ctx, namespaceEntry)
 	if err != nil {
 		return NamespaceEntry{}, AccessBox{}, err
 	}
@@ -2220,12 +2237,13 @@ func resolveFile(
 // ChunkCount for filename, as seen by owner. Benchmark-only; see the
 // package note above.
 func DebugFileVersionForBenchmark(owner *User, filename string) (version uint64, chunkCount uint64, err error) {
-	_, accessBox, err := resolveFile(owner, filename)
+	ctx := operationContext()
+	_, accessBox, err := resolveFile(ctx, owner, filename)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	metadata, err := loadMetadata(accessBox)
+	metadata, err := loadMetadata(ctx, accessBox)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -2241,7 +2259,8 @@ func DebugFileVersionForBenchmark(owner *User, filename string) (version uint64,
 // returns a description of the first violation found, or "" if none.
 // Benchmark-only; see the package note above.
 func CheckAuthorizationInvariantsForBenchmark(owner *User, filename string, expectedVersion uint64) string {
-	namespaceEntry, accessBox, err := resolveFile(owner, filename)
+	ctx := operationContext()
+	namespaceEntry, accessBox, err := resolveFile(ctx, owner, filename)
 	if err != nil {
 		return "resolveFile: " + err.Error()
 	}
@@ -2250,7 +2269,7 @@ func CheckAuthorizationInvariantsForBenchmark(owner *User, filename string, expe
 		return "caller is not the owner"
 	}
 
-	structure, err := loadOwnerAccessBoxStructure(namespaceEntry, accessBox)
+	structure, err := loadOwnerAccessBoxStructure(ctx, namespaceEntry, accessBox)
 	if err != nil {
 		return "loadOwnerAccessBoxStructure: " + err.Error()
 	}
@@ -2259,7 +2278,7 @@ func CheckAuthorizationInvariantsForBenchmark(owner *User, filename string, expe
 		return "AccessBoxStructure.CurrentEpoch does not match owner AccessBox.EpochID"
 	}
 
-	metadata, err := loadMetadata(accessBox)
+	metadata, err := loadMetadata(ctx, accessBox)
 	if err != nil {
 		return "loadMetadata: " + err.Error()
 	}
@@ -2274,7 +2293,7 @@ func CheckAuthorizationInvariantsForBenchmark(owner *User, filename string, expe
 
 	for recipient, record := range structure.RecipientBoxes {
 		var branchBox AccessBox
-		err := loadDatastoreObject(
+		err := loadDatastoreObject(ctx, 
 			accessBoxObjectType,
 			record.BoxUUID,
 			record.BoxEncKey,
@@ -2296,11 +2315,12 @@ func CheckAuthorizationInvariantsForBenchmark(owner *User, filename string, expe
 
 //load metadata from datastore
 func loadMetadata (
+	ctx context.Context,
 	accessBox AccessBox,
 ) (Metadata, error) {
 	var metadata Metadata
 
-    err := loadDatastoreObject(
+    err := loadDatastoreObject(ctx, 
         metadataObjectType,
         accessBox.MetadataUUID,
         accessBox.MetadataEncKey,
@@ -2347,6 +2367,7 @@ func loadMetadata (
 }
 
 func loadFileContentAndChunkUUIDs(
+	ctx context.Context,
 	accessBox AccessBox,
 	metadat Metadata,
 ) (
@@ -2382,7 +2403,7 @@ func loadFileContentAndChunkUUIDs(
 
         	var chunk Chunk
 
-        	err = loadDatastoreObject(
+        	err = loadDatastoreObject(ctx, 
             	chunkObjectType,
             	currentUUID,
             	chunkEncKey,
@@ -2465,6 +2486,7 @@ func loadFileContentAndChunkUUIDs(
 // one complete, self-consistent logical file state -- never a half
 // re-chunked overwrite or a half-published append.
 func (userdata *User) LoadFile(filename string) (content []byte, err error) {
+	ctx := operationContext()
 	txn, err := allocateTxnID()
 	if err != nil {
 		return nil, err
@@ -2485,7 +2507,7 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 		return nil, err
 	}
 
-	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	namespaceEntry, err := loadNamespaceEntry(ctx, userdata, filename)
 	if err != nil {
 		return nil, err
 	}
@@ -2495,20 +2517,20 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 		return nil, err
 	}
 
-	accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	accessBox, err := validateFileAccessUnderLock(ctx, namespaceEntry)
 	if err != nil {
 		return nil, err
 	}
 
 	fireConcurrencyTestHook("load:file-locked:" + filename)
 
-	metadata, err := loadMetadata(accessBox)
+	metadata, err := loadMetadata(ctx, accessBox)
 
 	if err != nil {
 		return nil, err
 	}
 
-	content, _, err = loadFileContentAndChunkUUIDs(
+	content, _, err = loadFileContentAndChunkUUIDs(ctx, 
 		accessBox,
 		metadata,
 	)
@@ -2738,6 +2760,7 @@ func buildInvitation(
 }
 
 func loadOwnerAccessBoxStructure(
+	ctx context.Context,
     namespaceEntry NamespaceEntry,
     accessBox AccessBox,
 ) (AccessBoxStructure, error) {
@@ -2768,7 +2791,7 @@ func loadOwnerAccessBoxStructure(
             errors.New("invalid structure keys")
     }
 
-    err := loadDatastoreObject(
+    err := loadDatastoreObject(ctx, 
         accessBoxStructureObjectType,
         namespaceEntry.AccessBoxStructureUUID,
         namespaceEntry.AccessBoxStructureEncKey,
@@ -2811,6 +2834,7 @@ func loadOwnerAccessBoxStructure(
 // namespace entry points to.
 func (userdata *User) CreateInvitation(filename string, recipientUsername string) (
 	invitationPtr uuid.UUID, err error) {
+	ctx := operationContext()
 	txn, err := allocateTxnID()
 	if err != nil {
 		return uuid.Nil, err
@@ -2831,7 +2855,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 		return uuid.Nil, err
 	}
 
-	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	namespaceEntry, err := loadNamespaceEntry(ctx, userdata, filename)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -2843,12 +2867,12 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 
 	// Revalidated fresh, under File X -- never reuse AccessBox/FileStatus
 	// state read before this lock was granted.
-	accessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	accessBox, err := validateFileAccessUnderLock(ctx, namespaceEntry)
 	if err != nil {
 		return uuid.Nil, err
 	}
 
-	recipientPKEKey, exists, err := keystoreGet(
+	recipientPKEKey, exists, err := keystoreGet(ctx, 
         getPKEKeyName(recipientUsername),
     )
     if err != nil {
@@ -2860,7 +2884,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
     }
 
     recipientVerifyKey, exists, err :=
-        keystoreGet(
+        keystoreGet(ctx, 
             getVerifyKeyName(recipientUsername),
         )
     if err != nil {
@@ -2885,7 +2909,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 
 	if namespaceEntry.IsOwner {
         structure, err :=
-            loadOwnerAccessBoxStructure(
+            loadOwnerAccessBoxStructure(ctx, 
                 namespaceEntry,
                 accessBox,
             )
@@ -2971,7 +2995,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
     }
 
 	if namespaceEntry.IsOwner {
-        if err := datastoreSet(
+        if err := datastoreSet(ctx, 
 			grantedBoxUUID,
 			protectedBranchBox,
 		); err != nil {
@@ -2979,7 +3003,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
         }
 
 		if structureChanged {
-			if err := datastoreSet(
+			if err := datastoreSet(ctx, 
 				namespaceEntry.AccessBoxStructureUUID,
 				protectedUpdatedStructure,
 			); err != nil {
@@ -2988,7 +3012,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 		}
 	}
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
         invitationUUID,
         invitationBytes,
     ); err != nil {
@@ -3002,6 +3026,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 Helper func for open invitation
 **/
 func openInvitation(
+	ctx context.Context,
     userdata *User,
     senderUsername string,
     invitationPtr uuid.UUID,
@@ -3019,7 +3044,7 @@ func openInvitation(
     }
 
     invitationBytes, exists, err :=
-        datastoreGet(invitationPtr)
+        datastoreGet(ctx, invitationPtr)
 
     if err != nil {
         return emptyPayload, err
@@ -3043,7 +3068,7 @@ func openInvitation(
 
     //Get the verification key
     senderVerifyKey, exists, err :=
-        keystoreGet(
+        keystoreGet(ctx, 
             getVerifyKeyName(senderUsername),
         )
 
@@ -3226,6 +3251,7 @@ func openInvitation(
 // validateInvitationAccessUnderLock's call to verifyFileStatus) is
 // guaranteed to observe it and fail.
 func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid.UUID, filename string) error {
+	ctx := operationContext()
 	if userdata == nil {
         return errors.New("recipient cannot be nil")
     }
@@ -3262,7 +3288,7 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 	// AcceptInvitation or StoreFile for this same (recipient, filename)
 	// can install/observe a different namespace state in between this
 	// check and this operation's own eventual install below.
-	_, occupied, err := datastoreGet(nameUUID)
+	_, occupied, err := datastoreGet(ctx, nameUUID)
 
     if err != nil {
         return err
@@ -3281,7 +3307,7 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
         return err
     }
 
-	payload, err := openInvitation(
+	payload, err := openInvitation(ctx, 
         userdata,
         senderUsername,
         invitationPtr,
@@ -3298,7 +3324,7 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 	// Revalidated fresh, under File S -- this is the authoritative check
 	// that a concurrent RevokeAccess cannot race past (see doc comment
 	// above).
-	_, err = validateInvitationAccessUnderLock(payload)
+	_, err = validateInvitationAccessUnderLock(ctx, payload)
 	if err != nil {
 		return err
 	}
@@ -3331,14 +3357,14 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
         return err
     }
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
         nameUUID,
         protectedNamespaceEntry,
     ); err != nil {
 		return err
 	}
 
-    if err := datastoreDelete(invitationPtr); err != nil {
+    if err := datastoreDelete(ctx, invitationPtr); err != nil {
     	return err
     }
 
@@ -3359,6 +3385,7 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 // caller's own NamespaceEntry that no other user's operation can change --
 // it needs no file-lock revalidation.
 func (userdata *User) RevokeAccess(filename string, recipientUsername string) error {
+	ctx := operationContext()
 	txn, err := allocateTxnID()
 	if err != nil {
 		return err
@@ -3379,7 +3406,7 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
 		return err
 	}
 
-	namespaceEntry, err := loadNamespaceEntry(userdata, filename)
+	namespaceEntry, err := loadNamespaceEntry(ctx, userdata, filename)
 	if err != nil {
 		return err
 	}
@@ -3397,14 +3424,14 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
 
 	// Revalidated fresh, under File X -- never reuse AccessBox/FileStatus
 	// state read before this lock was granted.
-	currentAccessBox, err := validateFileAccessUnderLock(namespaceEntry)
+	currentAccessBox, err := validateFileAccessUnderLock(ctx, namespaceEntry)
 	if err != nil {
 		return err
 	}
 
 	//load the structure
 	structure, err :=
-        loadOwnerAccessBoxStructure(
+        loadOwnerAccessBoxStructure(ctx, 
             namespaceEntry,
             currentAccessBox,
         )
@@ -3422,13 +3449,13 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
     }
 
 	//load the metadata
-	metadata, err := loadMetadata(currentAccessBox)
+	metadata, err := loadMetadata(ctx, currentAccessBox)
     if err != nil {
         return err
     }
 
 	fileContent, oldChunkUUIDs, err :=
-        loadFileContentAndChunkUUIDs(
+        loadFileContentAndChunkUUIDs(ctx, 
             currentAccessBox,
             metadata,
         )
@@ -3608,21 +3635,21 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
         return err
     }
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
         newBaseChunkUUID,
         protectedNewChunk,
     ); err != nil {
 		return err
 	}
 
-    if err := datastoreSet(
+    if err := datastoreSet(ctx, 
         newMetadataUUID,
         protectedNewMetadata,
     ); err != nil {
     	return err
     }
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
         namespaceEntry.AccessBoxUUID,
         protectedOwnerAccessBox,
     ); err != nil {
@@ -3630,7 +3657,7 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
 	}
 
 	for _, write := range survivingWrites {
-        if err := datastoreSet(
+        if err := datastoreSet(ctx, 
             write.BoxUUID,
             write.Data,
         ); err != nil {
@@ -3638,34 +3665,34 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
         }
     }
 
-	if err := datastoreSet(
+	if err := datastoreSet(ctx, 
         namespaceEntry.AccessBoxStructureUUID,
         protectedUpdatedStructure,
     ); err != nil {
 		return err
 	}
 
-    if err := datastoreSet(
+    if err := datastoreSet(ctx, 
         currentAccessBox.StatusUUID,
         newFileStatusBytes,
     ); err != nil {
     	return err
     }
 
-	if err := datastoreDelete(
+	if err := datastoreDelete(ctx, 
         revokedRecord.BoxUUID,
     ); err != nil {
 		return err
 	}
 
-    if err := datastoreDelete(
+    if err := datastoreDelete(ctx, 
         currentAccessBox.MetadataUUID,
     ); err != nil {
     	return err
     }
 
     for _, oldChunkUUID := range oldChunkUUIDs {
-        if err := datastoreDelete(oldChunkUUID); err != nil {
+        if err := datastoreDelete(ctx, oldChunkUUID); err != nil {
         	return err
         }
     }
