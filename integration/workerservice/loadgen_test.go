@@ -129,6 +129,9 @@ func TestLoadgenDrivesWorkerService(t *testing.T) {
 			if strings.Contains(string(output), "DATA CORRUPTION") {
 				t.Errorf("loadgen -workload %s failed its own correctness oracle:\n%s", workload, output)
 			}
+			if strings.Contains(string(output), "VERIFICATION ERROR") {
+				t.Errorf("loadgen -workload %s could not verify its own correctness oracle:\n%s", workload, output)
+			}
 
 			replicasServed := parseReplicasServed(t, string(output))
 			if replicasServed < 2 {

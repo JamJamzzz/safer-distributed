@@ -36,7 +36,7 @@ func main() {
 		log.Fatalf("loadgen: %v", err)
 	}
 	fmt.Println(report.String())
-	if report.Failed > 0 || len(report.OracleFailures) > 0 {
+	if report.Failed > 0 || len(report.OracleFailures) > 0 || len(report.VerificationErrors) > 0 {
 		os.Exit(1)
 	}
 }

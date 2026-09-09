@@ -50,11 +50,27 @@ type Report struct {
 
 	// OracleFailures is non-empty when a completed run's actual data
 	// disagrees with what the recorded successful operations say should
-	// be there -- see checkOracles. A non-nil RPC error already means an
-	// operation failed; this catches the more dangerous case where every
-	// RPC reported success and the data is still wrong (a lost or
-	// duplicated write, or a read that returned the wrong bytes).
+	// be there -- see checkOracles. This is real evidence of corrupted or
+	// lost data: the verification LoadFile succeeded, and the bytes it
+	// returned are provably wrong.
+	//
+	// This is deliberately NOT the same bucket as VerificationErrors
+	// below. An earlier version of checkOracles put both under one
+	// "DATA CORRUPTION" label, which overstated what a failed
+	// verification call actually shows: a worker that is merely
+	// unavailable when checkOracles tries to LoadFile (a live OOM kill
+	// mid-run, for instance) proves nothing about whether the data itself
+	// is intact -- it might be perfectly fine and simply unreachable at
+	// that moment.
 	OracleFailures []string
+
+	// VerificationErrors is non-empty when checkOracles could not
+	// complete its check at all -- the verification LoadFile call itself
+	// failed (RPC error, unavailable worker, timeout). This is still a
+	// real problem worth a non-zero exit code, since a run this tool
+	// cannot verify is not a run it can vouch for, but it is a weaker
+	// claim than OracleFailures: it says "unknown", not "wrong".
+	VerificationErrors []string
 }
 
 func (r Report) String() string {
@@ -67,6 +83,9 @@ func (r Report) String() string {
 	}
 	for _, f := range r.OracleFailures {
 		s += fmt.Sprintf("\n  DATA CORRUPTION: %s", f)
+	}
+	for _, e := range r.VerificationErrors {
+		s += fmt.Sprintf("\n  VERIFICATION ERROR: %s", e)
 	}
 	return s
 }
@@ -236,13 +255,22 @@ func runOne(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, 
 // belongs, not a separate oracle pass), since a read that returns the
 // wrong bytes is detected the moment it happens, with no need to wait for
 // the run to finish.
-func checkOracles(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, users []*user) []string {
+// checkOracles returns (dataFailures, verificationErrors). The two are
+// kept separate because they are different claims: a dataFailure means
+// checkOracles successfully read the file and the bytes are provably
+// wrong (real corruption or a lost/duplicated write); a verificationError
+// means the check itself could not run -- most commonly the verification
+// LoadFile call failing because a worker is unavailable -- which says
+// nothing about whether the data is actually intact. Folding a failed
+// verification call into "data corruption" (an earlier version of this
+// function did) overstates what was observed: a worker that is down
+// cannot have its file's bytes inspected at all, corrupted or not.
+func checkOracles(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, users []*user) (dataFailures, verificationErrors []string) {
 	if cfg.Workload == WorkloadReads {
-		return nil
+		return nil, nil
 	}
 
 	seen := make(map[string]bool, len(users))
-	var failures []string
 	for _, u := range users {
 		if seen[u.username] {
 			continue
@@ -258,17 +286,18 @@ func checkOracles(ctx context.Context, cfg Config, client workerv1.SaferWorkerCl
 		})
 		cancel()
 		if err != nil {
-			failures = append(failures, fmt.Sprintf("user %s: verifying final content: %v", u.username, err))
+			verificationErrors = append(verificationErrors,
+				fmt.Sprintf("user %s: could not verify final content: %v", u.username, err))
 			continue
 		}
 
 		if got := int64(len(resp.GetContent())); got != want {
-			failures = append(failures, fmt.Sprintf(
+			dataFailures = append(dataFailures, fmt.Sprintf(
 				"user %s: file is %d bytes, want %d (initial %d + %d successful append(s) x %d bytes)",
 				u.username, got, want, cfg.ContentSize, successes, cfg.ContentSize))
 		}
 	}
-	return failures
+	return dataFailures, verificationErrors
 }
 
 // run executes cfg's workload against conn and returns a Report.
@@ -345,17 +374,18 @@ func run(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report, error)
 	// Oracle verification happens after the timed run, exactly like
 	// setup: it is a correctness check, not load, and must not be
 	// counted as either.
-	oracleFailures := checkOracles(ctx, cfg, client, users)
+	oracleFailures, verificationErrors := checkOracles(ctx, cfg, client, users)
 
 	return Report{
-		Workload:       cfg.Workload,
-		Requested:      cfg.Count,
-		Attempted:      attempted,
-		Succeeded:      succeeded,
-		Failed:         failed,
-		Elapsed:        elapsed,
-		FirstErrors:    firstErrors,
-		Replicas:       tally.snapshot(),
-		OracleFailures: oracleFailures,
+		Workload:           cfg.Workload,
+		Requested:          cfg.Count,
+		Attempted:          attempted,
+		Succeeded:          succeeded,
+		Failed:             failed,
+		Elapsed:            elapsed,
+		FirstErrors:        firstErrors,
+		Replicas:           tally.snapshot(),
+		OracleFailures:     oracleFailures,
+		VerificationErrors: verificationErrors,
 	}, nil
 }

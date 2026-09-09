@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,7 +29,14 @@ type fakeWorkerClient struct {
 	// without writing anything -- a synthetic lost update.
 	dropAppendNumber int32
 	appendCalls      int32
+
+	// failLoadFile, if true, makes every LoadFile call return an error --
+	// simulating a worker that is unavailable when checkOracles tries to
+	// verify, as opposed to one that is up and returning wrong bytes.
+	failLoadFile bool
 }
+
+var errFakeLoadFileUnavailable = errors.New("fake: worker unavailable")
 
 func newFakeWorkerClient() *fakeWorkerClient {
 	return &fakeWorkerClient{files: make(map[string][]byte)}
@@ -60,6 +68,9 @@ func (f *fakeWorkerClient) AppendToFile(_ context.Context, in *workerv1.AppendTo
 func (f *fakeWorkerClient) LoadFile(_ context.Context, in *workerv1.LoadFileRequest, _ ...grpc.CallOption) (*workerv1.LoadFileResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failLoadFile {
+		return nil, errFakeLoadFileUnavailable
+	}
 	return &workerv1.LoadFileResponse{Content: append([]byte(nil), f.files[in.GetUsername()]...)}, nil
 }
 
@@ -92,9 +103,12 @@ func TestCheckOracles_PassesWhenEveryAppendLands(t *testing.T) {
 		}
 	}
 
-	failures := checkOracles(context.Background(), cfg, client, users)
-	if len(failures) != 0 {
-		t.Fatalf("checkOracles reported failures with no lost updates: %v", failures)
+	dataFailures, verificationErrors := checkOracles(context.Background(), cfg, client, users)
+	if len(dataFailures) != 0 {
+		t.Fatalf("checkOracles reported data failures with no lost updates: %v", dataFailures)
+	}
+	if len(verificationErrors) != 0 {
+		t.Fatalf("checkOracles reported verification errors with a healthy fake: %v", verificationErrors)
 	}
 }
 
@@ -128,20 +142,82 @@ func TestCheckOracles_DetectsLostUpdate(t *testing.T) {
 		t.Fatalf("successfulAppends = %d, want 4 (runOne must not itself detect the drop)", got)
 	}
 
-	failures := checkOracles(context.Background(), cfg, client, users)
-	if len(failures) != 1 {
-		t.Fatalf("checkOracles found %d failures, want exactly 1: %v", len(failures), failures)
+	dataFailures, verificationErrors := checkOracles(context.Background(), cfg, client, users)
+	if len(verificationErrors) != 0 {
+		t.Fatalf("checkOracles reported verification errors for a lost update it could actually read: %v", verificationErrors)
 	}
-	if !strings.Contains(failures[0], users[0].username) {
-		t.Errorf("failure message does not name the affected user: %q", failures[0])
+	if len(dataFailures) != 1 {
+		t.Fatalf("checkOracles found %d data failures, want exactly 1: %v", len(dataFailures), dataFailures)
+	}
+	if !strings.Contains(dataFailures[0], users[0].username) {
+		t.Errorf("failure message does not name the affected user: %q", dataFailures[0])
 	}
 	// 4 reported successes at 8 bytes each, but only 3 actually landed:
 	// the file is 8 bytes short of what checkOracles expects.
 	wantLen := cfg.ContentSize + 4*cfg.ContentSize
 	gotLen := wantLen - cfg.ContentSize
-	if !strings.Contains(failures[0], strconv.Itoa(gotLen)) || !strings.Contains(failures[0], strconv.Itoa(wantLen)) {
+	if !strings.Contains(dataFailures[0], strconv.Itoa(gotLen)) || !strings.Contains(dataFailures[0], strconv.Itoa(wantLen)) {
 		t.Errorf("failure message %q does not mention both the actual (%d) and expected (%d) length",
-			failures[0], gotLen, wantLen)
+			dataFailures[0], gotLen, wantLen)
+	}
+}
+
+// TestCheckOracles_ClassifiesUnavailableWorkerAsVerificationError is the
+// fix this file exists for: when the verification LoadFile call itself
+// fails (a worker that is unavailable, e.g. after an OOM kill), that is
+// NOT evidence the data is wrong -- it is evidence the check could not
+// run. checkOracles must report it as a VerificationError, never mixed
+// into dataFailures / printed as "DATA CORRUPTION".
+func TestCheckOracles_ClassifiesUnavailableWorkerAsVerificationError(t *testing.T) {
+	client := newFakeWorkerClient()
+	cfg := Config{Workload: WorkloadIndependentWrites, Users: 1, ContentSize: 8}
+	users := testUsers(t, client, cfg, 1)
+	content := make([]byte, cfg.ContentSize)
+	tally := newReplicaTally()
+
+	if err := runOne(context.Background(), cfg, client, tally, users[0], content, content); err != nil {
+		t.Fatalf("runOne: %v", err)
+	}
+
+	// The data is actually fine; only the verification call itself will
+	// fail, simulating an unavailable worker rather than a lost update.
+	client.failLoadFile = true
+
+	dataFailures, verificationErrors := checkOracles(context.Background(), cfg, client, users)
+	if len(dataFailures) != 0 {
+		t.Fatalf("checkOracles reported data corruption for an unreachable-but-not-wrong file: %v", dataFailures)
+	}
+	if len(verificationErrors) != 1 {
+		t.Fatalf("checkOracles found %d verification errors, want exactly 1: %v", len(verificationErrors), verificationErrors)
+	}
+	if !strings.Contains(verificationErrors[0], users[0].username) {
+		t.Errorf("verification error does not name the affected user: %q", verificationErrors[0])
+	}
+	if !strings.Contains(verificationErrors[0], errFakeLoadFileUnavailable.Error()) {
+		t.Errorf("verification error %q does not surface the underlying RPC error", verificationErrors[0])
+	}
+}
+
+// TestReport_SeparatesDataCorruptionFromVerificationErrors pins the
+// output format both classifications produce, so a caller (or a test
+// parsing loadgen's log output, like integration/workerservice's) sees
+// two distinct, differently-labeled lines rather than one overloaded one.
+func TestReport_SeparatesDataCorruptionFromVerificationErrors(t *testing.T) {
+	report := Report{
+		OracleFailures:     []string{"user alice: file is 8 bytes, want 16"},
+		VerificationErrors: []string{"user bob: could not verify final content: unavailable"},
+		Replicas:           map[string]int64{},
+		Elapsed:            1,
+	}
+	s := report.String()
+	if !strings.Contains(s, "DATA CORRUPTION: user alice") {
+		t.Errorf("report does not label the data failure as DATA CORRUPTION:\n%s", s)
+	}
+	if !strings.Contains(s, "VERIFICATION ERROR: user bob") {
+		t.Errorf("report does not label the verification failure as VERIFICATION ERROR:\n%s", s)
+	}
+	if strings.Contains(s, "DATA CORRUPTION: user bob") {
+		t.Errorf("report mislabeled bob's verification error as data corruption:\n%s", s)
 	}
 }
 
