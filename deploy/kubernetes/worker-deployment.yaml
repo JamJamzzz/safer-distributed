@@ -31,6 +31,11 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - "-addr=0.0.0.0:50052"
+            # DefaultAuthConcurrency (2, see cmd/worker/config.go's doc)
+            # is repeated explicitly here rather than left implicit, so
+            # the number that this deployment's memory limit below is
+            # actually sized against is visible in the same file.
+            - "-auth-concurrency=2"
           ports:
             - name: grpc
               containerPort: 50052
@@ -67,13 +72,39 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           resources:
-            # Conservative development defaults, not derived from any
-            # benchmark (see docs/distributed-roadmap.md and cmd/loadgen,
-            # which is functional/correctness tooling for this phase, not
-            # a sizing tool yet).
+            # Development defaults, evidence-informed but NOT production
+            # capacity planning (Phase 4.6; see docs/distributed-
+            # roadmap.md's Phase 4.6 section for the full measurement).
+            #
+            # A first live run at the original 256Mi limit OOM-killed all
+            # three worker replicas under the checked-in loadgen Job's
+            # own default concurrency. Measuring at controlled loadgen
+            # concurrency levels (1/2/4/8) against real kind pods found:
+            # a worker settles at roughly 150-165Mi of resident memory
+            # after any burst of concurrent GetUserContext/InitUserContext
+            # activity (each call performs an Argon2 key derivation or
+            # RSA/DS key generation, and Go's allocator does not hand
+            # that memory back to the OS quickly, so the level persists
+            # between bursts rather than decaying -- confirmed stable
+            # across repeated runs, not growing further, so this is
+            # concurrency pressure, not a leak); two such calls
+            # genuinely overlapping in one process reached as much as
+            # ~217Mi observed; four or more overlapping reliably
+            # exceeded 256Mi and triggered the OOM kill this comment
+            # describes.
+            #
+            # -auth-concurrency=2 above caps the worst case at two
+            # overlapping calls per process, so these values are sized
+            # against that ceiling with headroom for measurement
+            # granularity, not against unbounded concurrency:
+            #   request: covers the ~165Mi steady-state plateau
+            #   limit: comfortably covers the ~217Mi two-concurrent peak
+            # CPU requests/limits are unchanged from Phase 4's original
+            # conservative defaults; nothing in this measurement bore on
+            # them.
             requests:
               cpu: "100m"
-              memory: "64Mi"
+              memory: "192Mi"
             limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "512Mi"
