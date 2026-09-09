@@ -33,9 +33,15 @@ failing each mutation of a real operation in turn, with a negative control showi
 same failure leaks partial state when the boundary is bypassed. Transactions need a
 replica set, which is what CI runs.
 
-This all holds under normal, graceful operation only: there are no leases or fencing
-tokens yet, so a crashed worker leaks its locks and a coordinator crash loses lock
-state.
+Worker failure is handled: transactions carry a lease, a crashed worker's locks are
+reclaimed automatically, and exclusive grants carry fencing tokens validated by a
+conditional write inside the commit transaction, so a stalled worker that wakes after
+losing its lock cannot commit. `integration/crossprocess` proves both with real killed
+and stalled processes, alongside a negative control showing the clobbering write that
+fencing prevents.
+
+The single coordinator remains an explicit failure domain: fence state is durable, but
+lock state is in memory, so a coordinator crash still loses who held what.
 
 ## CI and concurrency verification
 

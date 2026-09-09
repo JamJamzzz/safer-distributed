@@ -83,11 +83,7 @@ V1 is correct and well tested **within one process**. Its two structural limits:
 - **Phase 3A — Remote coordination.** Done. See "Cross-process coordination" below.
 - **Phase 3B — Atomic MongoDB persistence.** Done. See "Multi-object writes are
   atomic" below.
-- **Phase 3C — Leases and fencing.** Next. `RenewLease`, lease expiry so a crashed
-  worker's locks are reclaimed, and fencing tokens so a revived worker cannot act on a
-  lock it has lost. Fencing has to be validated atomically with the writes it guards,
-  which is why the transaction substrate came first. This is what turns the
-  graceful-operation claim into one that survives failure.
+- **Phase 3C — Worker-failure recovery.** Done. See "Worker failure" below.
 
 Cryptography, authenticated envelopes, UUID addressing, authorization/capability
 semantics, Namespace/File resources, Version/Epoch behavior, and the public SAFER API
@@ -291,18 +287,103 @@ lost). The tests detect the failure they claim to.
 
 ### What this does not cover
 
-- A worker that dies without calling `EndTransaction` **leaks its locks** until the
-  coordinator restarts. There are no leases yet.
 - A coordinator crash **loses all lock state**, and workers holding locks are not told.
-  It is a single process with in-memory state, not replicated.
-- There are no fencing tokens, so nothing stops a stalled worker from acting after its
-  lock should have been considered lost.
+  It is a single process with in-memory state, not replicated. A *worker* crash is
+  handled as of Phase 3C; a *coordinator* crash is not.
 - Multi-object MongoDB writes are atomic as of Phase 3B, but that covers a mutation
   that fails; it does nothing about a worker that dies still holding locks.
 - The gRPC channel is not encrypted or authenticated. SAFER's objects are encrypted and
   authenticated before reaching storage, so this channel carries no plaintext content
   and no key material -- only resource identifiers and lock modes -- but an attacker on
   it could forge lock traffic. It is meant for a trusted network.
+
+## Worker failure (Phase 3C)
+
+A worker can die. Phase 3C makes that survivable: its locks come back on their own, and
+if it wakes up later it cannot act on a lock it has lost.
+
+### Leases
+
+A transaction's lease starts when its **first lock is granted**, not when the
+transaction first appears - a transaction queued behind someone else should not be
+punished for waiting. The worker renews while it works, and the coordinator is
+authoritative for the deadline: every response carries it, and the worker schedules its
+next renewal at a third of the time actually remaining. That last part was a bug the
+cross-process tests caught - a worker pacing renewals from a locally configured
+interval got revoked while perfectly healthy, because the coordinator's lease was
+shorter than the worker assumed.
+
+A passed deadline **releases nothing by itself**. It makes a transaction eligible for
+revocation, which runs in a fixed order:
+
+1. mark it revoking - no further `Acquire`, no further `RenewLease`
+2. cancel its in-flight `Acquire` requests
+3. durably invalidate every exclusive fence it owns
+4. **only then** release its locks through the LockManager
+5. leave a tombstone, so a returning worker is told its transaction is over rather than
+   silently handed a fresh one
+
+Step 3 before step 4 is the safety property: releasing first would let the next holder
+begin writing while the previous holder's token was still valid.
+
+If the fence store is unreachable during step 3, the locks **stay held** and cleanup
+retries. `Health` reports the stuck transaction, so an operator can see that locks are
+held deliberately rather than leaked. This is a deliberate choice of availability loss
+over unsafe handoff.
+
+### Fencing
+
+Exclusive grants carry a fencing token; shared grants do not, because a stale reader
+corrupts nothing and fencing readers would make them conflict for no benefit. Tokens
+only move forward, and allocation **fails closed**: if a token cannot be made durable
+the grant is refused and the lock given back, since an unfenced exclusive grant is a
+writer nothing could later stop.
+
+The validation at commit is a **conditional write, not a read**, and that distinction
+is the whole design. SAFER's storage transactions use MongoDB snapshot reads, so a
+transaction that merely *read* the fence document would see its own token as of the
+snapshot it started with - still apparently valid no matter what happened since - and
+commit anyway. Updating the same document the coordinator writes creates a real
+write-conflict boundary, so the database itself refuses the stale writer. The filter is
+the grant's full identity (resource, exact token, owning transaction), it runs after
+the mutation's writes and immediately before commit, and **every** grant is checked,
+since an operation holding X on several resources loses the whole mutation if it lost
+any one of them.
+
+Grants reach the storage transaction on the operation-scoped context that already
+carries the MongoDB session - no globals, no goroutine identity, consistent with the
+Phase 3B design.
+
+### RPC surface
+
+`Acquire`, `EndTransaction`, `RenewLease`, `Health`. Still no `BeginTransaction`, and
+still no per-resource `Release`.
+
+`Acquire` is retry-safe: an identical request for a resource the transaction already
+holds returns the existing grant and the **same** token, without calling the
+LockManager and without allocating a second token, so a retry after a lost response
+recovers the original outcome. A different mode on a held resource is still
+`FailedPrecondition` - no upgrades, no reentrancy. `RenewLease` and `EndTransaction`
+are idempotent.
+
+### Evidence
+
+| Test | Shows |
+| --- | --- |
+| Killed worker | A is SIGKILLed holding X with no `EndTransaction`; B is blocked while A lives, then proceeds. A's write is absent, B's present, version advanced once, no permanent leak |
+| Stale writer | A stalls, loses its lease, B commits with a newer token; A wakes and its commit is refused by fence validation specifically |
+| **Negative control** | The identical schedule with validation bypassed **must** produce the bad commit - and does: the stale writer clobbered committed state, leaving `base-STALE` with the fresh append gone |
+| Lease survives a long operation | A worker that keeps renewing is **not** revoked across several lease lengths - revocation follows the missing renewal, not elapsed time |
+| Fence-store outage | Invalidation fails, locks stay held, `Health` reports it; on recovery, cleanup succeeds and the waiter proceeds |
+| Retry / idempotency | The same `Acquire` returns the same token; `RenewLease` and `EndTransaction` are idempotent; shared locks allocate no token; a graceful end invalidates before handing over |
+
+### Liveness
+
+`RunAtomic` applies one explicit transaction-level deadline (`SAFER_MONGO_TXN_TIMEOUT`,
+default 30s) when the caller supplied none. Phase 3B's decision to add no
+*per-statement* timeouts inside a transaction stands - expiring one statement aborts
+the whole transaction, so ordinary contention would look like failure - but an
+unbounded transaction could hold a lease alive indefinitely, and now cannot.
 
 ## Claims not yet earned
 
@@ -313,10 +394,17 @@ Recorded here so they are not asserted prematurely:
   coordinator and one database, and all-or-nothing multi-object persistence, both
   verified by real multi-process/failure-injection tests with negative controls. Not
   earned: any behavior under worker crashes, coordinator crashes, or partitions.
-- **No worker crash tolerance, no lease recovery, no stale-writer protection, and no
-  coordinator fault tolerance.** Atomic storage means a mutation that *fails* leaves
-  nothing behind. It does not help a worker that *dies* mid-operation still holding
-  locks: those locks stay held until the coordinator restarts.
+- **Worker crash recovery, bounded lock reclamation, and stale-writer protection are
+  earned** as of Phase 3C, verified with real killed and stalled processes and a
+  negative control. "Bounded" means bounded by the lease, plus however long fence
+  invalidation takes to succeed - an unreachable fence store extends it indefinitely,
+  on purpose.
+- **No coordinator fault tolerance.** The single coordinator remains an explicit
+  failure domain. Fence state is durable, but lock state is in memory: if the
+  coordinator dies, who held what is lost, and workers holding locks are not told.
+  Solving that needs replication and consensus, deliberately out of scope.
+- **No claim about network partitions.** Nothing has been tested against a partition
+  between a worker and the coordinator while storage stays reachable.
 - **Durability, plus atomicity of failed mutations.** Verified: data written through
   one SAFER client and connection pool is readable through a separate one afterwards,
   and a mutation that fails part way leaves no committed partial state. Not verified:
