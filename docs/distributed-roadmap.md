@@ -142,9 +142,22 @@ additional indexes.
 ### What MongoDB is not
 
 MongoDB is persistence. It performs no locking on SAFER's behalf and knows nothing
-about SAFER's logical resources. Strict 2PL, S/X locks, and FIFO fairness remain in
-SAFER's lock layer, which is still process-local. Two SAFER workers sharing one
-MongoDB are **not** safely serialized today; that is exactly what Phase 3 is for.
+about SAFER's logical resources: it never sees a Namespace or a File, only opaque
+encrypted blobs at UUIDs.
+
+Strict 2PL, S/X locks, and FIFO fairness live in SAFER's lock layer, which since Phase
+3A reaches across processes through the lock coordinator rather than being confined to
+one process. The two layers stay separate and are not substitutes for each other:
+
+- **MongoDB** makes a multi-object mutation atomic and durable (Phase 3B). It does not
+  decide who may mutate, or in what order.
+- **The coordinator** decides who holds which logical resource, and in what order
+  (Phase 3A). It stores no SAFER data.
+
+So workers sharing one MongoDB are serialized by the coordinator, not by the database.
+Two workers pointed at the same database but at *different* coordinators — or at none —
+are still not serialized with respect to each other, because nothing in MongoDB
+enforces SAFER's logical locking.
 
 The userlib backend's global datastore latch is deliberately not carried over. It
 exists because userlib's Go maps are unsynchronized in-process state; imposing it here
@@ -194,13 +207,15 @@ Each operation's commit point, and what a partial commit would mean:
 | `AppendToFile` | new chunk + metadata | The append silently dropped while consuming a Version, or a tail that cannot be read |
 | `CreateInvitation` | branch access box, structure entry, invitation | A capability pointing at nothing, or a grant `RevokeAccess` cannot find — a permanently unrevokable share |
 | `AcceptInvitation` | namespace entry + invitation consumption | An invitation that can be accepted twice, or a recipient with no route to the file |
-| `RevokeAccess` | new chunk, new metadata, owner box, every surviving branch box, structure, status, and reclamation of the revoked box, old metadata and old chunks (8 mutations) | The worst case: a file unreadable to everyone, or an owner who believes access was withdrawn while the revoked box is still in place |
+| `RevokeAccess` | new chunk, new metadata, owner box, **every surviving branch box**, structure, status, and reclamation of the revoked box, old metadata and old chunks — a variable count that grows with the number of surviving recipients and old chunks | The worst case: a file unreadable to everyone, or an owner who believes access was withdrawn while the revoked box is still in place |
 
 #### Rollback evidence
 
 `integration/rollback_test.go` fails the Nth storage mutation inside a real operation
 against a real replica set. `StoreFile` create and `RevokeAccess` measure their own
-mutation counts and fail **every** mutation in turn rather than assuming a number.
+mutation counts at runtime and fail **every** mutation in turn rather than assuming a
+number — `RevokeAccess`'s count is not fixed, since it scales with the surviving
+recipients and old chunks of the file being revoked.
 Each iteration asserts the operation errors, the object count is unchanged, previously
 valid state still loads and authenticates, and Version/ChunkCount and authorization are
 unchanged — including that a failed revocation does not half-revoke.
