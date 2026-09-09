@@ -31,6 +31,8 @@ import (
 	"syscall"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/JamJamzzz/safer-distributed/client/coordination/grpccoord"
 	"github.com/JamJamzzz/safer-distributed/client/fencing/mongofence"
@@ -74,6 +76,20 @@ func run(cfg Config) error {
 
 	server := grpc.NewServer()
 	coordinatorv1.RegisterLockCoordinatorServer(server, coordinator)
+
+	// The gRPC health-checking protocol, for Kubernetes' native grpc
+	// probes (see deploy/kubernetes/coordinator). This is a coarser signal
+	// than LockCoordinator.Health -- that RPC reports operational detail
+	// (active/revoking transaction counts, held locks) for a worker or
+	// operator to inspect, while this just answers "is this process
+	// serving". It is set SERVING once, here, and never toggled: by this
+	// point openFenceStore has already either succeeded or this process
+	// would have exited (fail-closed, Phase 4.0), so there is no
+	// meaningful degraded state to report afterward the way the worker's
+	// readiness loop reports a downstream outage.
+	healthServer := health.NewServer()
+	healthpb.RegisterHealthServer(server, healthServer)
+	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
 	// The bound address goes to stdout on its own line, so a supervisor
 	// or a test harness can start this with port 0 and learn where it
