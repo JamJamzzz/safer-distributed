@@ -96,6 +96,18 @@ kubectl -n safer-distributed rollout restart deployment/safer-worker deployment/
 process startup -- the same reason any other ConfigMap change in this
 repository's manifests needs one.)
 
+### Metric temporality
+
+`otel-config.yaml` also sets
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta`. The Go OTLP metric
+exporter defaults to cumulative temporality; Datadog's own OTLP ingestion
+recommends delta instead, and cumulative would also mean a short-lived
+workload's datapoints (e.g. one loadgen Job's run) are only ever expressed as
+running totals since process start rather than as their own discrete
+values -- delta keeps that per-run activity visible. This is read directly
+by the OTLP metric exporter itself (not by `internal/telemetry`'s own code),
+the same standard-env-var mechanism as everything else in this ConfigMap.
+
 ## What "OTLP-compatible" does and does not mean here
 
 The application never imports a Datadog-specific tracing or metrics library

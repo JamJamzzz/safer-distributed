@@ -42,3 +42,11 @@ data:
   # CR's spec.global.tags already applies to infrastructure telemetry, so
   # application traces/metrics carry the same environment identity.
   OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=dev"
+  # Read directly by the OTLP metric gRPC exporter itself (not by
+  # internal/telemetry's own code -- see its doc.go), this is the
+  # standard OTel variable for choosing cumulative vs. delta metric
+  # temporality. The exporter defaults to "cumulative"; Datadog's own
+  # OTLP ingestion documentation recommends "delta" instead. See
+  # deploy/kubernetes/telemetry/README.md for why this matters here
+  # specifically.
+  OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "delta"
