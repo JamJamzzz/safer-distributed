@@ -5,11 +5,14 @@
 // SAFER_COORDINATOR_ADDR.
 //
 // Fencing requires durable state, so this process needs the same MongoDB
-// deployment the workers use (SAFER_MONGO_URI / SAFER_MONGO_DB). It stores
-// only coordination metadata there -- resource ids, counters, owner ids --
-// never SAFER object content. Started without it, the coordinator still
-// serves locks but issues no fencing tokens, which means no stale-writer
-// protection; it says so loudly at startup rather than appearing healthy.
+// deployment the workers use (SAFER_MONGO_URI / SAFER_MONGO_DB). By
+// default this is not optional: a coordinator that cannot durably fence
+// exclusive grants offers no stale-writer protection at all (see
+// client/fencing), so startup fails rather than serving an unsafe
+// deployment that merely looks healthy. The -allow-unfenced flag exists to
+// opt out of that for local development or lock-semantics-only testing; it
+// is never appropriate in production, and it says so loudly at startup
+// when used.
 //
 // Limits, deliberately not hidden: this process is the single point of
 // coordination and its lock state is in memory. If it dies, that state is
@@ -20,7 +23,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -37,44 +39,37 @@ import (
 )
 
 func main() {
-	address := flag.String("addr", "127.0.0.1:0",
-		"address to listen on; port 0 picks a free port and prints it")
-	lease := flag.Duration("lease", grpccoord.DefaultLeaseDuration,
-		"how long a transaction's locks survive without a renewal")
-	sweep := flag.Duration("sweep", grpccoord.DefaultSweepInterval,
-		"how often to look for expired leases")
-	flag.Parse()
-
-	config := grpccoord.ServerConfig{LeaseDuration: *lease, SweepInterval: *sweep}
-
-	// The fence store is what makes stale-writer protection possible.
-	mongoCfg, configured, err := mongostore.ConfigFromEnv()
+	cfg, err := parseConfig(os.Args[1:])
 	if err != nil {
-		log.Fatalf("coordinator: MongoDB configuration: %v", err)
+		log.Fatalf("coordinator: %v", err)
 	}
-	if configured {
-		fences, err := mongofence.Open(context.Background(), mongofence.Config{
-			URI:      mongoCfg.URI,
-			Database: mongoCfg.Database,
-			Timeout:  mongoCfg.Timeout,
-		})
-		if err != nil {
-			log.Fatalf("coordinator: opening the fence store: %v", err)
-		}
-		defer func() { _ = fences.Close(context.Background()) }()
-		config.Fences = fences
-		log.Printf("coordinator: fencing enabled, using database %q", mongoCfg.Database)
-	} else {
-		log.Printf("coordinator: WARNING: %s is not set, so no fencing tokens will be issued "+
-			"and there is NO stale-writer protection", mongostore.EnvURI)
+	if err := run(cfg); err != nil {
+		log.Fatalf("coordinator: %v", err)
 	}
+}
 
-	listener, err := net.Listen("tcp", *address)
+// run starts the coordinator and serves until it is asked to stop.
+func run(cfg Config) error {
+	fences, closeFences, err := openFenceStore(cfg)
 	if err != nil {
-		log.Fatalf("coordinator: listen on %s: %v", *address, err)
+		return err
+	}
+	if closeFences != nil {
+		defer closeFences()
 	}
 
-	coordinator := grpccoord.NewServerWithConfig(config)
+	serverConfig := grpccoord.ServerConfig{
+		LeaseDuration: cfg.LeaseDuration,
+		SweepInterval: cfg.SweepInterval,
+		Fences:        fences,
+	}
+
+	listener, err := net.Listen("tcp", cfg.Address)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.Address, err)
+	}
+
+	coordinator := grpccoord.NewServerWithConfig(serverConfig)
 	defer coordinator.Stop()
 
 	server := grpc.NewServer()
@@ -97,6 +92,56 @@ func main() {
 	}()
 
 	if err := server.Serve(listener); err != nil {
-		log.Fatalf("coordinator: serve: %v", err)
+		return fmt.Errorf("serve: %w", err)
 	}
+	return nil
+}
+
+// openFenceStore opens the durable fencing store MongoDB configuration
+// describes, or fails closed if none is configured or reachable.
+//
+// This is the Phase 4.0 boundary: a production coordinator must not serve
+// remote X-lock coordination without durable fencing, because an unfenced
+// exclusive grant is a writer nothing can later stop (see client/fencing
+// and docs/distributed-roadmap.md). cfg.AllowUnfenced is the one escape
+// hatch, meant for local development and tests that only exercise lock
+// semantics; it is logged loudly precisely so it cannot be mistaken for a
+// supported production mode.
+func openFenceStore(cfg Config) (fences grpccoord.FenceStore, closeFn func(), err error) {
+	mongoCfg, configured, err := mongostore.ConfigFromEnv()
+	if err != nil {
+		return nil, nil, fmt.Errorf("MongoDB configuration: %w", err)
+	}
+
+	if !configured {
+		if !cfg.AllowUnfenced {
+			return nil, nil, fmt.Errorf(
+				"%s is not set; a production coordinator refuses to start without a durable "+
+					"fencing store (pass -allow-unfenced to override for local development or "+
+					"lock-semantics-only testing -- this gives NO stale-writer protection)",
+				mongostore.EnvURI)
+		}
+		log.Printf("coordinator: WARNING: -allow-unfenced set and %s is not set, so no fencing "+
+			"tokens will be issued and there is NO stale-writer protection; this is not a "+
+			"supported production configuration", mongostore.EnvURI)
+		return nil, nil, nil
+	}
+
+	store, err := mongofence.Open(context.Background(), mongofence.Config{
+		URI:      mongoCfg.URI,
+		Database: mongoCfg.Database,
+		Timeout:  mongoCfg.Timeout,
+	})
+	if err != nil {
+		if !cfg.AllowUnfenced {
+			return nil, nil, fmt.Errorf("opening the fence store: %w", err)
+		}
+		log.Printf("coordinator: WARNING: -allow-unfenced set and the fence store is unreachable "+
+			"(%v); starting anyway with NO stale-writer protection; this is not a supported "+
+			"production configuration", err)
+		return nil, nil, nil
+	}
+
+	log.Printf("coordinator: fencing enabled, using database %q", mongoCfg.Database)
+	return store, func() { _ = store.Close(context.Background()) }, nil
 }
