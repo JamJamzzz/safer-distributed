@@ -81,10 +81,13 @@ V1 is correct and well tested **within one process**. Its two structural limits:
   transactions, which a standalone `mongod` cannot serve) and fails if integration
   tests skip.
 - **Phase 3A — Remote coordination.** Done. See "Cross-process coordination" below.
-- **Phase 3B — Leases and fencing.** Next. `RenewLease`, lease expiry so a crashed
+- **Phase 3B — Atomic MongoDB persistence.** Done. See "Multi-object writes are
+  atomic" below.
+- **Phase 3C — Leases and fencing.** Next. `RenewLease`, lease expiry so a crashed
   worker's locks are reclaimed, and fencing tokens so a revived worker cannot act on a
-  lock it has lost. This is what turns Phase 3A's graceful-operation claim into
-  something that survives failure.
+  lock it has lost. Fencing has to be validated atomically with the writes it guards,
+  which is why the transaction substrate came first. This is what turns the
+  graceful-operation claim into one that survives failure.
 
 Cryptography, authenticated envelopes, UUID addressing, authorization/capability
 semantics, Namespace/File resources, Version/Epoch behavior, and the public SAFER API
@@ -148,19 +151,64 @@ exists because userlib's Go maps are unsynchronized in-process state; imposing i
 would serialize a backend whose purpose is concurrent shared access, and would not
 coordinate anything across processes anyway.
 
-### Known limitation: multi-object writes are not atomic
+### Multi-object writes are atomic (Phase 3B)
 
-Several SAFER operations write several objects in sequence (file creation writes a
-chunk, metadata, an access box, a status record, a structure record, and a namespace
-entry). With the `userlib` backend these writes could not fail. With MongoDB they can,
-and there is currently no transaction around them: a backend failure part-way through
-leaves some objects written and others not.
+Several SAFER operations write several objects. On MongoDB each such mutation now runs
+inside one transaction, so it commits entirely or not at all.
 
-This is a real gap, not a theoretical one. The operation reports the error rather than
-claiming success, and SAFER's authenticated envelopes mean a partial write cannot be
-passed off as valid content — but the stored state can be left incomplete. Wrapping
-these sequences in MongoDB transactions is the natural next storage-layer step; it
-needs a replica set, since standalone `mongod` does not support them.
+The boundary is scoped by **context**, not by anything global. `storage.RunAtomic`
+hands the callback a context carrying a MongoDB session; storage calls made with that
+context — and only those — join the transaction. The session travels from the
+`operationContext()` at the top of a public operation down that operation's own call
+stack, so two concurrent operations each get their own transaction with no shared
+mutable state between them. There is no process-global "current session", no goroutine
+identity, and no backend swapping, each of which would be wrong the moment two
+operations overlap. Nesting is refused rather than silently flattened.
+
+The order around it is deliberate:
+
+```
+acquire logical SAFER locks -> revalidate state -> Mongo transaction -> commit -> end transaction
+```
+
+A Mongo transaction is never opened and then made to wait for a lock; that would pin
+database resources for the length of another worker's critical section.
+
+The `userlib` backend has no transaction capability, so `RunAtomic` runs the callback
+directly there. That is V1's behavior — not a weaker transaction but no transaction —
+and it is left honest rather than faked, since a transaction that silently commits
+partial state would be worse than none.
+
+Transactions require a replica set. A standalone `mongod` accepts writes but rejects
+transactions, which is why CI runs a single-node replica set.
+
+#### Mutation boundaries
+
+Each operation's commit point, and what a partial commit would mean:
+
+| Operation | Objects written in one transaction | Partial commit would mean |
+| --- | --- | --- |
+| `InitUser` | 2 public keys + account record | An unrepairable account: key registration is write-once, so a claimed username with missing keys can never be fixed |
+| `StoreFile` (create) | chunk, metadata, access box, status, structure, namespace entry | A namespace entry pointing at a missing access box, or orphaned ciphertext nothing references — both unreachable through SAFER's API, so never cleaned up |
+| `StoreFile` (overwrite) | new chunk, metadata switch, old-chunk reclamation | Metadata naming a chunk that was never written, or old chunks reclaimed while metadata still references them — an unreadable file |
+| `AppendToFile` | new chunk + metadata | The append silently dropped while consuming a Version, or a tail that cannot be read |
+| `CreateInvitation` | branch access box, structure entry, invitation | A capability pointing at nothing, or a grant `RevokeAccess` cannot find — a permanently unrevokable share |
+| `AcceptInvitation` | namespace entry + invitation consumption | An invitation that can be accepted twice, or a recipient with no route to the file |
+| `RevokeAccess` | new chunk, new metadata, owner box, every surviving branch box, structure, status, and reclamation of the revoked box, old metadata and old chunks (8 mutations) | The worst case: a file unreadable to everyone, or an owner who believes access was withdrawn while the revoked box is still in place |
+
+#### Rollback evidence
+
+`integration/rollback_test.go` fails the Nth storage mutation inside a real operation
+against a real replica set. `StoreFile` create and `RevokeAccess` measure their own
+mutation counts and fail **every** mutation in turn rather than assuming a number.
+Each iteration asserts the operation errors, the object count is unchanged, previously
+valid state still loads and authenticates, and Version/ChunkCount and authorization are
+unchanged — including that a failed revocation does not half-revoke.
+
+The negative control is what makes those assertions mean something: with the
+transaction capability removed and the identical failure injected, the same `StoreFile`
+leaves **5 partially committed objects** behind. It fails loudly if it ever stops
+leaking.
 
 ## Cross-process coordination (Phase 3A)
 
@@ -234,7 +282,8 @@ lost). The tests detect the failure they claim to.
   It is a single process with in-memory state, not replicated.
 - There are no fencing tokens, so nothing stops a stalled worker from acting after its
   lock should have been considered lost.
-- Multi-object MongoDB writes are still not atomic (see the storage limitation above).
+- Multi-object MongoDB writes are atomic as of Phase 3B, but that covers a mutation
+  that fails; it does nothing about a worker that dies still holding locks.
 - The gRPC channel is not encrypted or authenticated. SAFER's objects are encrypted and
   authenticated before reaching storage, so this channel carries no plaintext content
   and no key material -- only resource identifiers and lock modes -- but an attacker on
@@ -244,18 +293,24 @@ lost). The tests detect the failure they claim to.
 
 Recorded here so they are not asserted prematurely:
 
-- **Cross-process coordination, under graceful operation only.** Earned: strict 2PL
-  across separate OS processes sharing one coordinator and one database, verified by
-  multi-process tests and a negative control. Not earned: any behavior under crashes,
-  partitions, or coordinator failure.
-- **Durability, narrowly.** Verified: data written through one SAFER client and
-  connection pool is readable through a separate one afterwards, which is what a worker
-  restart looks like from storage's point of view. Not verified: crash consistency, or
-  behavior under a mid-operation failure — see the atomicity limitation above.
+- **Cross-process strict 2PL plus atomic durable MongoDB mutations, under graceful
+  operation only.** Earned: strict 2PL across separate OS processes sharing one
+  coordinator and one database, and all-or-nothing multi-object persistence, both
+  verified by real multi-process/failure-injection tests with negative controls. Not
+  earned: any behavior under worker crashes, coordinator crashes, or partitions.
+- **No worker crash tolerance, no lease recovery, no stale-writer protection, and no
+  coordinator fault tolerance.** Atomic storage means a mutation that *fails* leaves
+  nothing behind. It does not help a worker that *dies* mid-operation still holding
+  locks: those locks stay held until the coordinator restarts.
+- **Durability, plus atomicity of failed mutations.** Verified: data written through
+  one SAFER client and connection pool is readable through a separate one afterwards,
+  and a mutation that fails part way leaves no committed partial state. Not verified:
+  crash consistency — a killed process mid-commit is not the same as a returned error,
+  and there are no kill tests.
 - **No fault-tolerance claim** — failure testing covers an injected failing storage
   backend, an unreachable one, an unreachable coordinator at startup, and cancelled or
   abandoned lock requests. There is no kill-the-database, kill-the-coordinator,
   kill-the-worker, or partition testing, and no lease or fencing machinery to make such
-  tests meaningful yet. That is Phase 3B.
+  tests meaningful yet. That is Phase 3C.
 - The checked-in benchmark tables are inherited historical SAFER-CC measurements, not
   performance claims about this repository.

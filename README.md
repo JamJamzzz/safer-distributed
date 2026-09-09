@@ -25,9 +25,17 @@ Lock coordination is likewise pluggable ([client/coordination](client/coordinati
 the default is V1's process-local `LockManager`, and a gRPC lock coordinator
 ([cmd/coordinator](cmd/coordinator)) extends the same strict-2PL semantics across
 separate worker processes. `integration/crossprocess` exercises that with real
-multi-process races. This holds under normal, graceful operation only: there are no
-leases or fencing tokens yet, so a crashed worker leaks its locks and a coordinator
-crash loses lock state.
+multi-process races.
+
+On MongoDB, every multi-object SAFER mutation runs in one transaction, so a failure
+part way through commits nothing; `integration/rollback_test.go` verifies this by
+failing each mutation of a real operation in turn, with a negative control showing the
+same failure leaks partial state when the boundary is bypassed. Transactions need a
+replica set, which is what CI runs.
+
+This all holds under normal, graceful operation only: there are no leases or fencing
+tokens yet, so a crashed worker leaks its locks and a coordinator crash loses lock
+state.
 
 ## CI and concurrency verification
 
