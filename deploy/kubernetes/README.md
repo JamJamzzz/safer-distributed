@@ -32,33 +32,37 @@ uses) before applying the rest.
 
 ## What was and was not actually run
 
-This environment has Docker but no running Kubernetes cluster (no
-`kind`/`minikube`, no Docker Desktop Kubernetes context -- `kubectl
-cluster-info` fails to connect). Concretely, for Phase 4:
+Phase 4.6 ran these actual manifests against a disposable `kind` cluster (see
+`docs/distributed-roadmap.md`'s Phase 4.6 section for the full incident and
+measurements). Concretely:
 
-- **Actually run**: all three Docker images built successfully and were
-  smoke-tested together on a plain Docker network against a real MongoDB
-  replica-set container -- coordinator, worker, and loadgen all
-  interoperating, plus the coordinator's fail-closed behavior verified
-  inside its own container. See `docker/README.md`.
-- **Statically validated only, not applied to a live cluster**: every
-  manifest in this directory. `kubectl kustomize deploy/kubernetes`
-  builds cleanly (confirms syntax and cross-references -- Service
-  selectors matching Deployment labels, ConfigMap/Secret names matching
-  `envFrom` references, etc.), and the standalone files
-  (`secret.yaml`, `loadgen-job.yaml`,
-  `networkpolicy-mongo-optional.yaml`) were validated the same way
-  through a throwaway kustomization. None of this exercises the
-  Kubernetes API server itself: no pod has actually been scheduled, no
-  probe has actually fired, no NetworkPolicy has actually been enforced
-  by a CNI plugin, and the `Recreate` rollout behavior on the coordinator
-  has not been observed in a live rollout.
-
-If a cluster becomes available (`kind create cluster`, Docker Desktop's
-Kubernetes toggle, or similar), running the Apply steps above and then
-`cmd/loadgen`'s Job is the natural next verification step -- nothing about
-these manifests is expected to need cluster-specific changes beyond
-pointing at wherever MongoDB actually lives.
+- **Actually run, live, on `kind`**: coordinator (`1/1` Ready) and all 3 workers
+  (`3/3` Ready) deployed from the real manifests, against an ephemeral in-cluster
+  MongoDB replica set stood up only for this test (not part of this directory's
+  manifests -- MongoDB is external/managed, see `docker/README.md`). The headless
+  Service's `dns:///` target resolved all three worker endpoints; `cmd/loadgen`'s
+  checked-in Job (`mixed`, `-concurrency=8 -count=200`) and a `same-file-writes` run
+  both completed with `failed=0`, no `DATA CORRUPTION`, no `VERIFICATION ERROR`, and
+  `replicas_served=3`. A worker pod was deleted directly; Kubernetes replaced it and
+  the Deployment returned to `3/3` Ready within a bounded wait, and a fresh workload
+  run afterward succeeded with the replacement pod actively serving traffic.
+  NetworkPolicy enforcement was confirmed directly, not assumed: an unlabeled pod's
+  traffic to the worker Service timed out (silently dropped), while an otherwise
+  identical pod carrying `safer-client: "true"` connected immediately.
+  **The first such run actually found a real bug**: at the original 256Mi worker
+  memory limit, all three workers were OOM-killed under the checked-in Job's own
+  default concurrency, which led to the bounded auth admission control
+  (`cmd/worker/authlimit.go`) and the revised `192Mi`/`512Mi` request/limit now in
+  `worker-deployment.yaml`.
+- **Also actually run**: all three Docker images smoke-tested together on a plain
+  Docker network against a real MongoDB replica-set container, independent of any
+  Kubernetes cluster. See `docker/README.md`.
+- **Not run even now**: the coordinator's `Recreate` rollout has still not been
+  observed in a live rollout (only worker-pod replacement was exercised -- a
+  Kubernetes Deployment reacting to a deleted pod, not a rollout, and not coordinator
+  fault tolerance, which remains explicitly out of scope). This was one run, on one
+  single-node `kind` cluster, on one host: not a multi-node cluster, not a soak test,
+  and not production capacity validation.
 
 ## Load balancing across worker replicas
 

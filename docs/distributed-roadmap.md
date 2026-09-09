@@ -612,14 +612,159 @@ with what the RPCs said happened.
 | Kubernetes manifests are internally consistent | `deploy/kubernetes/manifest_test.go`: `kubectl kustomize` builds the full manifest set and the files intentionally excluded from it, catching a broken cross-reference (e.g. a Service selector that stops matching a Deployment's labels) |
 | Existing Phase 1-3C correctness | Full suite (`go test ./...`, with and without `SAFER_MONGO_URI`) re-run clean after every Phase 4 change, including `integration/crossprocess` and `integration/rollback_test.go` |
 
-**Not evidence of a live Kubernetes deployment.** No Kubernetes cluster was available
-in the environment this phase was built in (no `kind`/`minikube`, no Docker Desktop
-Kubernetes context -- `kubectl cluster-info` fails to connect). The manifests are
-statically validated, not applied: no pod has actually been scheduled, no probe has
-actually fired against a kubelet, no NetworkPolicy has actually been enforced by a
-CNI plugin, and the coordinator's `Recreate` rollout has not been observed in a live
-rollout. See `deploy/kubernetes/README.md` for the precise boundary between what ran
-and what was only reviewed.
+**Live Kubernetes evidence exists as of Phase 4.6** (see that section below) via a
+disposable `kind` cluster. Everything above this point in Phase 4's own section was
+still statically validated only at the time it was written -- no cluster was
+available yet -- and that limitation is what the first live run in Phase 4.6
+immediately exposed: the manifests as originally sized OOM-killed every worker
+replica under real load. See `deploy/kubernetes/README.md` for the day-to-day
+boundary between what is exercised statically versus live.
+
+## Cloud-native deployment hardening (Phase 4.6)
+
+Phase 4.5's first live `kind` run -- the first time any of Phase 4's manifests had
+actually touched a running Kubernetes API server -- immediately found a real problem
+static validation could not have caught: all three worker replicas were OOM-killed
+(`exitCode: 137`, `reason: OOMKilled`) within about 45 seconds of the checked-in
+`loadgen-job.yaml` starting against them at its own default settings (`workload=mixed`,
+`concurrency=8`, `count=200`). This section is that incident's investigation and fix,
+not something to gloss over: a real deployment problem, found by actually deploying,
+is exactly what static manifest validation cannot substitute for.
+
+### Root cause: concurrent Argon2 key derivation, not sequential setup
+
+The first hypothesis -- that `cmd/loadgen`'s `setup()` phase issues 8 concurrent
+`InitUser` calls -- was wrong and was corrected before any code changed.
+`cmd/loadgen/workload.go`'s `setup()` is a single sequential loop; it does not spawn
+goroutines. The actual hot path is every ordinary `StoreFile`/`AppendToFile`/`LoadFile`
+RPC re-authenticating its caller through `client.GetUserContext` ->
+`deriveAccountKey` -> `userlib.Argon2Key`, which is *by design*, stateless, and exactly
+what makes any worker replica able to serve any request (see cmd/worker's package
+doc). `userlib.Argon2Key` calls `golang.org/x/crypto/argon2.IDKey` with a memory
+parameter of `64*1024` KiB (64 MiB) per call -- a fixed, deliberate cost of the
+memory-hard KDF the SAFER-CC crypto layer already used, not a bug and not something
+this phase weakens. `InitUser` separately performs RSA/DS key generation, its own
+expensive crypto.
+
+Measuring a real worker process under `crictl stats` at controlled `-concurrency`
+levels (1/2/4/8, same `workload=mixed`/`count=200` shape as the checked-in Job)
+against the same three live pods found:
+
+| Concurrency | Worker restarted? | Peak observed memory | Result |
+| --- | --- | --- | --- |
+| 1 | No | ~148-163 MB | `attempted=200 succeeded=200 failed=0` |
+| 2 | No (this run) | up to ~217 MB on one replica | `attempted=200 succeeded=200 failed=0` |
+| 4 | Yes -- OOMKilled | ~268 MB observed before the kill | `succeeded=24 failed=176`, mixed `DATA CORRUPTION`/RPC-error output (see below) |
+| 8 | Yes -- OOMKilled, repeatedly | not captured (killed before the ~300ms poller could sample it) | loadgen could not even complete its `dns:///` dial -- every worker was crash-looping |
+
+Peak memory at low concurrency is a *sampling* high-water mark (polling every ~300ms
+via `crictl stats`, not a continuous trace), stated as a limitation rather than an
+exact figure. Repeating the concurrency-1 run three times back to back found idle
+memory settling at a stable ~150-165 MB plateau each time -- not climbing further run
+over run -- which is Go's allocator retaining committed heap pages rather than
+returning them to the OS quickly (normal Go runtime behavior once a large allocation
+like Argon2's has happened), not a memory leak in this repository's code. No leak
+evidence was found, and none is claimed.
+
+Answering the three questions this investigation was scoped to:
+
+1. **Does worker memory increase materially with concurrent request/auth load?** Yes,
+   substantially -- from a ~150 MB single-caller plateau toward and past 256 MB as
+   concurrent overlap increases.
+2. **At what concurrency does 256Mi fail?** Between 2 and 4: 2 succeeded in the
+   measured run but left little headroom (~217 MB observed against a 256 MB limit);
+   4 reliably failed.
+3. **Is the pressure consistent with concurrent Argon2/GetUser work rather than a
+   monotonic leak?** Yes -- confirmed by the repeated-run plateau test above.
+
+### Bounded admission control, not just a bigger memory limit
+
+Raising the memory limit alone would not have fixed anything: an unbounded number of
+concurrent `GetUserContext`/`InitUserContext` calls in one process has no upper bound
+on memory at all, so no static limit is actually safe against it, only less likely to
+be hit soon. `cmd/worker/authlimit.go` adds `authLimiter`, a small context-aware
+semaphore bounding how many of those two calls may run at once in one worker process
+(`-auth-concurrency`, default `DefaultAuthConcurrency = 2`, chosen directly from the
+measurements above: it permits real concurrency while keeping a worker's expected
+peak, roughly two overlapping ~160-220 MB sections, inside the revised memory limit).
+It wraps only the expensive section -- lock acquisition and the MongoDB transaction
+that follow authentication are not gated -- and changes no SAFER semantics: no
+server-side session, no cached password or derived key, no weakened Argon2
+parameters, and `GetUserContext`'s authentication itself is never bypassed. `InitUser`
+uses the identical limiter, since its key generation is exactly the same class of
+cost. `cmd/worker/authlimit_test.go` and `cmd/worker/authenticate`'s tests prove,
+deterministically: at most N sections run concurrently; a waiter whose context is
+cancelled while queued for a slot returns promptly without taking one; a failed
+authentication still releases its slot (checked with a limiter of size 1, where a
+leaked permit would deadlock the very next call); and ordinary requests are
+unaffected.
+
+### Kubernetes memory limit, re-derived from evidence
+
+`deploy/kubernetes/worker-deployment.yaml`'s worker resources changed from
+`request: 64Mi` / `limit: 256Mi` to `request: 192Mi` / `limit: 512Mi`, sized against
+the measurements above with `-auth-concurrency=2` capping the worst case: the request
+covers the ~150-165 MB steady-state plateau with margin, and the limit comfortably
+covers the ~217 MB two-concurrent peak plus headroom for the sampling limitation
+already noted. These remain development/load-test defaults, now evidence-informed
+rather than an unverified guess -- **not** production capacity planning, which would
+need a longer, more thorough load-test regime this phase did not run. The checked-in
+Job's own default concurrency (8) was deliberately left unchanged rather than lowered
+to make the symptom disappear: the fix is admission control and correct sizing, not
+hiding the workload that found the bug.
+
+### Oracle error classification
+
+`cmd/loadgen`'s `checkOracles` used to report a verification `LoadFile` call that
+failed outright (an unavailable worker, e.g. mid-OOM-kill) under the same
+`"DATA CORRUPTION"` label as an actual length mismatch -- overstating what was
+observed, since a worker that cannot be reached proves nothing about whether its data
+is actually wrong. `Report` now separates `OracleFailures` (the verification call
+succeeded and the bytes are provably wrong -- real corruption or a lost/duplicated
+write) from `VerificationErrors` (the check itself could not run), printed under
+distinct `DATA CORRUPTION` and `VERIFICATION ERROR` labels respectively. Both still
+exit non-zero -- an unverifiable run is not one this tool can vouch for -- but only
+the former is evidence of corrupted or lost data. `cmd/loadgen/workload_test.go`
+covers both classifications with a fake worker client that can fail `LoadFile`
+outright, independent of any data mismatch.
+
+### Live `kind` result, after the fix
+
+Rebuilt images, loaded into the same disposable cluster, manifests re-applied,
+bounded `kubectl rollout status` waits throughout (never an unbounded wait):
+
+- Coordinator: `1/1` Ready. Workers: `3/3` Ready, `restartCount: 0` for all three
+  before, during, and after every subsequent run in this section -- no OOM at the
+  revised limits under the unmodified, checked-in `loadgen-job.yaml`.
+- The headless Service's `dns:///` target resolved all three ready worker endpoints;
+  `mixed` (the checked-in Job as-is) reported
+  `attempted=200 succeeded=200 failed=0`, `replicas_served=3` with a near-even
+  71/72/73 split, no `DATA CORRUPTION`, no `VERIFICATION ERROR`.
+- `same-file-writes` (`-concurrency=8 -count=200`) reported
+  `attempted=200 succeeded=200 failed=0`, `replicas_served=3` (67/67/68), its
+  lost-write oracle clean -- real cross-replica strict 2PL correctness under load,
+  against real pods.
+- **Worker failure exercise**: one worker pod deleted directly (`kubectl delete pod`)
+  while the Deployment was otherwise healthy. Kubernetes scheduled a replacement
+  pod immediately; the Deployment returned to `3/3` Ready within the same bounded
+  wait used throughout. A fresh `mixed` run afterward reported
+  `attempted=200 succeeded=200 failed=0` with `replicas_served=3` including the new
+  replacement pod actively serving traffic (72/72/72) -- this is worker
+  replaceability under a normal Kubernetes Deployment, **not** coordinator fault
+  tolerance, which remains explicitly out of scope (see "No coordinator fault
+  tolerance" below).
+- **NetworkPolicy enforcement was actually verified, not just assumed**: kindnet in
+  this cluster does enforce `NetworkPolicy`. A pod without the `safer-client: "true"`
+  label timed out reaching the worker Service (traffic silently dropped); an
+  otherwise-identical pod carrying that label connected immediately (a gRPC-protocol
+  reset from a plain HTTP client, not a network-level block). This is the intended
+  allow/deny boundary actually holding on a live cluster, not a static reading of the
+  YAML.
+
+This was run once, on one disposable `kind` cluster, on one host. It is real evidence
+that the fix works and that the deployment is functionally correct under a worker
+failure; it is not a substitute for a longer soak test, a real multi-node cluster, or
+production capacity planning, none of which this phase attempted.
 
 ## Claims not yet earned
 
@@ -664,16 +809,18 @@ Recorded here so they are not asserted prematurely:
   above).
 - The checked-in benchmark tables are inherited historical SAFER-CC measurements, not
   performance claims about this repository.
-- **No live Kubernetes verification.** Phase 4's manifests are statically validated
-  (`kubectl kustomize` builds cleanly, cross-references checked by
-  `deploy/kubernetes/manifest_test.go`) but were never applied to a running cluster --
-  none was available in the environment they were built in. No pod has actually been
-  scheduled, no readiness/liveness probe has actually fired against a kubelet, no
-  NetworkPolicy has actually been enforced by a CNI plugin, and the coordinator's
-  `Recreate` rollout has not been observed in a live rollout. What WAS run end-to-end:
-  all three Docker images together on a plain Docker network against real MongoDB
-  (`docker/README.md`), and the equivalent multi-process topology through Go
-  integration tests (`integration/workerservice`).
+- **Live Kubernetes verification exists as of Phase 4.6, but is limited in scope.** A
+  disposable `kind` cluster ran the actual manifests: coordinator and all 3 workers
+  reached Ready, readiness/liveness probes fired for real against a kubelet, a worker
+  pod was deleted and Kubernetes replaced it with the Deployment returning to `3/3`
+  Ready, and NetworkPolicy enforcement was confirmed directly (an unlabeled pod's
+  traffic to the worker Service was silently dropped; a labeled one connected). See
+  "Cloud-native deployment hardening (Phase 4.6)" above for the full run. What
+  remains unverified: the coordinator's `Recreate` rollout has still not been observed
+  in a live rollout (only worker-pod replacement was exercised, which is not
+  coordinator fault tolerance); this was one run, on one single-node `kind` cluster,
+  on one host, not a multi-node cluster, a longer soak test, or anything resembling
+  production capacity validation.
 - **No cryptographic service authentication, and the worker channel is genuinely
   higher-risk than the coordinator's.** Neither gRPC transport is authenticated or
   encrypted at the application layer. The coordinator's channel, unchanged from Phase
