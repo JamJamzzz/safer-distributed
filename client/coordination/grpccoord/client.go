@@ -264,11 +264,34 @@ func (g *remoteGuard) renewalDelay() time.Duration {
 
 // Acquire blocks until the coordinator grants the lock.
 //
-// The call carries no client-side deadline: waiting is the normal,
-// correct outcome of contention under strict 2PL, and a timeout here would
-// convert ordinary waiting into failure. What bounds the wait is the
-// holder ending its transaction.
+// It is equivalent to AcquireContext(context.Background(), ...): kept for
+// source compatibility with callers that predate context-aware
+// acquisition. Prefer AcquireContext for anything driven by an external
+// request (a gRPC handler, in particular), so a caller that goes away
+// actually stops waiting instead of leaving this goroutine, and the
+// coordinator's wait queue entry, parked until the transaction ends.
 func (g *remoteGuard) Acquire(resource lockmanager.ResourceID, mode lockmanager.LockMode) error {
+	return g.AcquireContext(context.Background(), resource, mode)
+}
+
+// AcquireContext is Acquire with cancellation and deadlines.
+//
+// The call still carries no independent client-side timeout of its own:
+// waiting is the normal, correct outcome of contention under strict 2PL,
+// and imposing one here would convert ordinary waiting into failure. What
+// bounds the wait now is either the holder ending its transaction, or
+// ctx being cancelled or expiring -- both are real ways for the wait to
+// end.
+//
+// A cancelled wait leaves no grant behind: cancelling ctx before the
+// gRPC call returns cancels the underlying Acquire RPC, which the
+// coordinator's own AcquireContext (see client/lockmanager) uses to pull
+// the request out of its wait queue rather than granting it to a caller
+// no longer listening. If ctx is cancelled after the grant already
+// arrived, the lock IS held -- this transaction acquired it fair and
+// square -- and it is up to the caller (via guard.ReleaseAll, always run
+// through a deferred call, never gated on ctx) to give it back.
+func (g *remoteGuard) AcquireContext(ctx context.Context, resource lockmanager.ResourceID, mode lockmanager.LockMode) error {
 	protoResource, err := resourceToProto(resource)
 	if err != nil {
 		return err
@@ -289,7 +312,7 @@ func (g *remoteGuard) Acquire(resource lockmanager.ResourceID, mode lockmanager.
 	g.acquired = true
 	g.mu.Unlock()
 
-	response, err := g.backend.client.Acquire(context.Background(), &coordinatorv1.AcquireRequest{
+	response, err := g.backend.client.Acquire(ctx, &coordinatorv1.AcquireRequest{
 		TransactionId: g.txn.String(),
 		Resource:      protoResource,
 		Mode:          protoMode,

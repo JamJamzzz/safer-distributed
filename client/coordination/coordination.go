@@ -33,12 +33,28 @@ import (
 // transaction holds every lock it takes until it ends, so exposing early
 // per-resource release would offer callers a way to violate the protocol.
 type Guard interface {
-	// Acquire blocks until the transaction holds mode on resource.
+	// Acquire blocks until the transaction holds mode on resource. It is
+	// equivalent to AcquireContext(context.Background(), ...): the legacy,
+	// non-cancellable form kept for source compatibility with V1 callers.
 	Acquire(resource lockmanager.ResourceID, mode lockmanager.LockMode) error
+
+	// AcquireContext is Acquire with cancellation and deadlines: if ctx is
+	// cancelled or its deadline passes while this call is waiting, it
+	// returns promptly with ctx's error, and the request is removed from
+	// the wait queue rather than left to be granted later with nothing to
+	// receive it. A caller must not treat a lock as held after
+	// AcquireContext returns an error -- see each implementation for the
+	// guarantee that no grant is left dangling.
+	AcquireContext(ctx context.Context, resource lockmanager.ResourceID, mode lockmanager.LockMode) error
 
 	// ReleaseAll ends the transaction, releasing every lock it holds. It
 	// must be safe to call more than once, since operations call it both
-	// on the success path and from a deferred cleanup.
+	// on the success path and from a deferred cleanup. It deliberately
+	// takes no context: cleanup must run to completion even when the
+	// context that started the operation is already cancelled or expired,
+	// or a cancelled caller would leak its locks forever. Implementations
+	// that need a deadline for their own cleanup RPCs use one derived from
+	// context.Background(), not the caller's.
 	ReleaseAll()
 }
 

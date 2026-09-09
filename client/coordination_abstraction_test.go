@@ -65,7 +65,11 @@ type recordingGuard struct {
 }
 
 func (g *recordingGuard) Acquire(resource lockmanager.ResourceID, mode lockmanager.LockMode) error {
-	if err := g.inner.Acquire(resource, mode); err != nil {
+	return g.AcquireContext(context.Background(), resource, mode)
+}
+
+func (g *recordingGuard) AcquireContext(ctx context.Context, resource lockmanager.ResourceID, mode lockmanager.LockMode) error {
+	if err := g.inner.AcquireContext(ctx, resource, mode); err != nil {
 		return err
 	}
 	g.backend.mu.Lock()

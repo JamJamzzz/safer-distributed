@@ -192,9 +192,24 @@ func UseUserlibStorage() (restore func()) {
 // its own call stack, so concurrent operations cannot see or disturb each
 // other's.
 //
-// V1's public API takes no context, so today this is just Background().
-// The plumbing is what matters: the same parameter carries cancellation
-// and deadlines, and tracing later, without another refactor.
+// operationContext is what the legacy, context-free API (InitUser,
+// GetUser, StoreFile, AppendToFile, LoadFile, and the operations that have
+// not yet grown a *Context sibling) runs under: always Background(), so
+// those callers keep V1's behavior exactly -- no cancellation, no
+// deadline, ever, which is what "context-free" has to mean for source
+// compatibility to hold.
+//
+// It is not what an operation driven by an external request should run
+// under. Those go through the *Context entry points instead
+// (InitUserContext, GetUserContext, (*User).StoreFileContext,
+// (*User).AppendToFileContext, (*User).LoadFileContext), which take a
+// caller-supplied context and thread it through both storage (as this
+// function's doc always described) and lock acquisition
+// (guard.AcquireContext, added alongside these). cmd/worker's gRPC
+// handlers call the *Context variants with the incoming request's
+// context, which is what makes a client's cancellation or deadline
+// actually reach a blocked lock wait or an in-flight MongoDB transaction
+// instead of stopping at this package's front door.
 func operationContext() context.Context { return context.Background() }
 
 // withFenceGrants attaches the transaction's fencing grants to ctx, so
@@ -440,8 +455,21 @@ func emacAccount(
 
 // NOTE: The following methods have toy (insecure!) implementations.
 
+// InitUser is InitUserContext(context.Background(), ...), kept for V1
+// source compatibility. Prefer InitUserContext for anything driven by an
+// external request, so cancellation and deadlines actually reach the
+// storage calls this makes.
 func InitUser(username string, password string) (userdataptr *User, err error) {
-	ctx := operationContext()
+	return InitUserContext(operationContext(), username, password)
+}
+
+// InitUserContext is InitUser with a caller-supplied context. It makes no
+// lock acquisitions (account creation is guarded by the account UUID's
+// write-once key registration, not by client/lockmanager), so there is no
+// AcquireContext call here to interrupt; ctx bounds only the storage calls
+// (getUserUUID's read, isUsernameTaken, and the account/key writes at the
+// end of this function).
+func InitUserContext(ctx context.Context, username string, password string) (userdataptr *User, err error) {
 	if username == "" {
 		return nil, errors.New("username cannot be empty")
 	}
@@ -605,8 +633,17 @@ func openAccount(
 	return account, nil
 }
 
+// GetUser is GetUserContext(context.Background(), ...), kept for V1
+// source compatibility.
 func GetUser(username string, password string) (userdataptr *User, err error) {
-	ctx := operationContext()
+	return GetUserContext(operationContext(), username, password)
+}
+
+// GetUserContext is GetUser with a caller-supplied context. Like
+// InitUserContext, it acquires no locks -- it only reads the account
+// envelope already at a known UUID -- so ctx bounds that one storage
+// call and nothing else.
+func GetUserContext(ctx context.Context, username string, password string) (userdataptr *User, err error) {
 	if username == "" {
 		return nil, errors.New("username cant be empty")
 	}
@@ -995,6 +1032,14 @@ func (g *globalMutexGuard) Acquire(_ lockmanager.ResourceID, _ lockmanager.LockM
 	return nil
 }
 
+// AcquireContext ignores ctx: the global mutex is an in-process
+// benchmark baseline that never blocks on anything a caller's
+// cancellation could usefully interrupt (sync.Mutex.Lock() itself is not
+// cancellable), so there is nothing more to do than Acquire already does.
+func (g *globalMutexGuard) AcquireContext(_ context.Context, resource lockmanager.ResourceID, mode lockmanager.LockMode) error {
+	return g.Acquire(resource, mode)
+}
+
 func (g *globalMutexGuard) ReleaseAll() {
 	if g.locked {
 		globalBenchmarkMutex.Unlock()
@@ -1006,7 +1051,10 @@ func (g *globalMutexGuard) ReleaseAll() {
 type noCCGuard struct{}
 
 func (noCCGuard) Acquire(_ lockmanager.ResourceID, _ lockmanager.LockMode) error { return nil }
-func (noCCGuard) ReleaseAll()                                                    {}
+func (noCCGuard) AcquireContext(_ context.Context, _ lockmanager.ResourceID, _ lockmanager.LockMode) error {
+	return nil
+}
+func (noCCGuard) ReleaseAll() {}
 
 // newOperationGuard is the one call site every public operation uses to
 // obtain its lock guard. Swapping strategies never touches anything else
@@ -1698,8 +1746,17 @@ func overwriteExistingFileLocked(
 // this transaction is deciding. All locks are released via
 // guard.ReleaseAll(), deferred immediately after the guard is created, so
 // every return path (success or error) releases them.
+// StoreFile is StoreFileContext(context.Background(), ...), kept for V1
+// source compatibility.
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {
-	ctx := operationContext()
+	return userdata.StoreFileContext(operationContext(), filename, content)
+}
+
+// StoreFileContext is StoreFile with a caller-supplied context: ctx bounds
+// both lock acquisition (via guard.AcquireContext, so a cancelled or
+// timed-out caller stops waiting on a held namespace/file lock rather than
+// blocking forever) and every storage/transaction call this makes.
+func (userdata *User) StoreFileContext(ctx context.Context, filename string, content []byte) (err error) {
 	txn, err := allocateTxnID()
 	if err != nil {
 		return err
@@ -1716,7 +1773,7 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		return err
 	}
 
-	if err := guard.Acquire(nsResource, lockmanager.ExclusiveLock); err != nil {
+	if err := guard.AcquireContext(ctx, nsResource, lockmanager.ExclusiveLock); err != nil {
 		return err
 	}
 
@@ -1742,7 +1799,7 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		}
 
 		fileResource := fileResourceID(namespaceEntry.FileID)
-		if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
+		if err := guard.AcquireContext(ctx, fileResource, lockmanager.ExclusiveLock); err != nil {
 			return err
 		}
 		ctx = withFenceGrants(ctx, guard) // every lock is held; the commit must prove them
@@ -1758,7 +1815,7 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 	fileID := uuid.New()
 
 	fileResource := fileResourceID(fileID)
-	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
+	if err := guard.AcquireContext(ctx, fileResource, lockmanager.ExclusiveLock); err != nil {
 		return err
 	}
 	ctx = withFenceGrants(ctx, guard) // every lock is held; the commit must prove them
@@ -1776,8 +1833,16 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 // that point is ever used to compute the update, which is what closes the
 // lost-update race described in the Phase 1 audit and Phase 3's
 // documented limitation.
+// AppendToFile is AppendToFileContext(context.Background(), ...), kept
+// for V1 source compatibility.
 func (userdata *User) AppendToFile(filename string, content []byte) error {
-	ctx := operationContext()
+	return userdata.AppendToFileContext(operationContext(), filename, content)
+}
+
+// AppendToFileContext is AppendToFile with a caller-supplied context: ctx
+// bounds lock acquisition and every storage/transaction call this makes,
+// exactly as StoreFileContext does.
+func (userdata *User) AppendToFileContext(ctx context.Context, filename string, content []byte) error {
 	txn, err := allocateTxnID()
 	if err != nil {
 		return err
@@ -1794,7 +1859,7 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 		return err
 	}
 
-	if err := guard.Acquire(nsResource, lockmanager.SharedLock); err != nil {
+	if err := guard.AcquireContext(ctx, nsResource, lockmanager.SharedLock); err != nil {
 		return err
 	}
 
@@ -1804,7 +1869,7 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 	}
 
 	fileResource := fileResourceID(namespaceEntry.FileID)
-	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
+	if err := guard.AcquireContext(ctx, fileResource, lockmanager.ExclusiveLock); err != nil {
 		return err
 	}
 	ctx = withFenceGrants(ctx, guard) // every lock is held; the commit must prove them
@@ -2558,8 +2623,15 @@ func loadFileContentAndChunkUUIDs(
 // either, so the AccessBox/Metadata/chunk chain observed here is always
 // one complete, self-consistent logical file state -- never a half
 // re-chunked overwrite or a half-published append.
+// LoadFile is LoadFileContext(context.Background(), ...), kept for V1
+// source compatibility.
 func (userdata *User) LoadFile(filename string) (content []byte, err error) {
-	ctx := operationContext()
+	return userdata.LoadFileContext(operationContext(), filename)
+}
+
+// LoadFileContext is LoadFile with a caller-supplied context: ctx bounds
+// lock acquisition and every storage call this makes.
+func (userdata *User) LoadFileContext(ctx context.Context, filename string) (content []byte, err error) {
 	txn, err := allocateTxnID()
 	if err != nil {
 		return nil, err
@@ -2576,7 +2648,7 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 		return nil, err
 	}
 
-	if err := guard.Acquire(nsResource, lockmanager.SharedLock); err != nil {
+	if err := guard.AcquireContext(ctx, nsResource, lockmanager.SharedLock); err != nil {
 		return nil, err
 	}
 
@@ -2586,7 +2658,7 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 	}
 
 	fileResource := fileResourceID(namespaceEntry.FileID)
-	if err := guard.Acquire(fileResource, lockmanager.SharedLock); err != nil {
+	if err := guard.AcquireContext(ctx, fileResource, lockmanager.SharedLock); err != nil {
 		return nil, err
 	}
 
