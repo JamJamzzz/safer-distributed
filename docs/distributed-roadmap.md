@@ -983,23 +983,23 @@ restarted:
   each fresh run in this session (69.4% -> 89.3% -> 80.6%), and the "Writer (previous
   minute)" stats-payload counters were non-zero immediately after a run. This is local,
   Agent-side evidence that OTLP-derived trace data tagged with this repository's exact
-  service names is reaching and being processed by the Agent. It is not the same as
-  visually confirming traces and metrics in the Datadog UI -- that verification is
-  manual and belongs to whoever has access to it, not something this repository can
-  fabricate. See the corresponding session handoff for the exact service names, span
-  names, and metric names to check. Datadog log ingestion was not enabled in this
-  phase (see "Logging" above), so there is nothing to check there yet.
+  service names is reaching and being processed by the Agent. At the time Phase 5
+  closed, this was Agent-side evidence only and the Datadog UI had not yet been
+  inspected; that inspection has since happened -- see "Distributed evidence phase:
+  closed" at the end of this document. Datadog log ingestion was not enabled in this
+  phase (see "Logging" above), so there is nothing to check there.
 
 ### What Phase 5 does not attempt
 
 Datadog log ingestion was not enabled or verified (see "Logging" above); no log/trace
-correlation, for the same reason. No answer yet to the "same-file-writes latency
-breakdown" question Phase 5 set out to use telemetry for: the actual observed
+correlation, for the same reason. Phase 5 also did not answer the "same-file-writes
+latency breakdown" question it set out to use telemetry for: the observed
 `safer.coordinator.lock.wait.duration`, `safer.worker.auth_admission.wait.duration`,
 and `safer.storage.transaction.duration` values only exist in Datadog once ingested,
-and reading them back needs Datadog UI or API access this repository's automation does
-not have and must not acquire on its own (the plaintext Datadog API key is explicitly
-off-limits). That analysis is deferred until those numbers are reported back.
+and reading them back needs UI access this repository's automation does not have and
+must not acquire on its own (the plaintext Datadog API key is explicitly off-limits).
+**That analysis is no longer deferred** -- it was completed in the final evidence pass
+recorded at the end of this document.
 
 ## Claims not yet earned
 
@@ -1078,3 +1078,62 @@ Recorded here so they are not asserted prematurely:
   guess. Neither status is production capacity planning, which needs a longer,
   multi-node soak-test regime this repository has not run. `cmd/loadgen` validates
   functional correctness under concurrency in this phase, not throughput or capacity.
+
+## Distributed evidence phase: closed (2026-09-09)
+
+The final distributed measurement pass is complete. Full report and raw evidence:
+[`benchmarks/distributed-final/2026-09-09/final-campaign-report.md`](../benchmarks/distributed-final/2026-09-09/final-campaign-report.md).
+
+Measured at commit `3fa018e67790e748c9f4e12b0987fd32a618573f` on the single-node
+`kind-safer-test` cluster: 3 workers (`-auth-concurrency=2`, CPU limit `500m`, memory
+limit `512Mi`), 1 coordinator, MongoDB, loadgen driving
+`dns:///safer-worker-headless:50052` at 64-byte content size.
+
+**Correctness and stability.** 33 valid runs (24 matched-pair + 6 secondary + warm-up
++ 2 sustained windows), more than 18,000 operations: zero failures, zero
+`DATA CORRUPTION`, zero `VERIFICATION ERROR`, `latency_samples == succeeded` in every
+run, `replicas_served == 3` in every run, and no worker or coordinator restarts or
+OOMKills.
+
+**Matched contention result.** The primary experiment compared `independent-writes`
+against `same-file-writes` -- the same `AppendToFile` operation under identical
+settings, differing only in whether callers share one user and file. At c ≤ 8 in this
+single-node development deployment, same-file contention produced no repeatable
+throughput penalty distinguishable from run-to-run variation (measured penalties
+0.0% / 3.4% / 2.8% / −1.4% at c = 1/2/4/8, against within-cell spread of comparable
+size). Throughput saturated near 14-15 ops/s for every workload shape tested,
+including read-only traffic that takes no exclusive lock; going from c=1 to c=8
+bought about 1.45x throughput while p99 latency grew roughly 6-8x. `c=1 -> c=2` is
+the only clear scaling step, and the fixed-count benchmark alone does not isolate the
+exact saturating resource.
+
+**Datadog attribution.** Two 120-second sustained windows (c=8, each fenced by 90s of
+idle) were inspected manually in the Datadog UI. Lock-manager wait rose from roughly
+46 microseconds under independent writes to roughly 63 milliseconds under same-file
+writes -- about three orders of magnitude. **Coordination cost was therefore real and
+measurable; it simply was not the binding throughput constraint at the tested scale.**
+Post-admission `GetUserContext` stayed in the same broad 0.2-0.4 s magnitude in both
+windows, and storage transaction duration stayed in the tens of milliseconds. The
+shared per-request authentication path is the leading explanation for the common
+ceiling, which remains an interpretation rather than an isolated causal result.
+
+**CPU throttling.** Read directly from cgroup v2 counters on the kind node (the
+kubelet metrics proxy endpoints were unavailable), with an idle negative control in
+which `nr_throttled` did not advance while `nr_periods` did. During both sustained
+windows workers used roughly 0.41-0.47 cores against a 0.5-core limit (about 83-93%
+of quota) and were throttled in roughly 70-94% of CFS periods. Worker CPU quota was
+genuinely binding under load. The causal share of authentication latency attributable
+to throttling was deliberately not isolated -- no CPU-limit A/B was run.
+
+**What measurement changed.** Code inspection made centralized exclusive-lock
+contention the obvious suspect. The matched experiment showed the contention was real
+yet not throughput-binding at this scale, and that workloads never touching the
+contended path hit the same ceiling. That removed the evidence basis for sharding or
+replicating the coordinator, or for weakening concurrency semantics to improve a
+benchmark number.
+
+**Technical status: FROZEN.** No correctness defect was found; the evidence is
+sufficient for this project's scope; the remaining performance findings are
+characteristics of the tested development deployment. Reopening technical development
+should require a genuine correctness defect or a new explicit project requirement --
+not the observation that a benchmark number could be higher.

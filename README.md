@@ -121,3 +121,44 @@ go run ./cmd/benchmark -out ./results
 go run ./cmd/benchmark -quiet
 go run ./cmd/benchmark -color never
 ```
+
+## Final distributed evidence
+
+The distributed system (3 stateless workers, a centralized gRPC strict-2PL lock
+coordinator, MongoDB with atomic transactions, leases and fencing, OpenTelemetry
+into Datadog) was measured in a controlled campaign on a single-node `kind`
+cluster. Full report and raw evidence:
+[`benchmarks/distributed-final/2026-09-09/final-campaign-report.md`](benchmarks/distributed-final/2026-09-09/final-campaign-report.md).
+
+The headline results, at commit `3fa018e`:
+
+- **Correctness held throughout.** 33 valid runs and more than 18,000 operations
+  with zero failures, zero lost updates caught by the load generator's own data
+  oracle, and no worker or coordinator restarts. All three replicas served every
+  run, verified per-RPC rather than assumed.
+- **A matched A/B isolated the cost of contention.** `same-file-writes` (all
+  callers serialized on one exclusive file lock) was compared against
+  `independent-writes` (a file per caller) under otherwise identical settings. At
+  concurrency ≤ 8 the contended workload showed no repeatable throughput penalty
+  distinguishable from run-to-run variation.
+- **Observability showed why that is not the whole story.** Datadog recorded
+  lock-manager wait rising about three orders of magnitude under contention, from
+  tens of microseconds to tens of milliseconds. Coordination cost was real; it
+  simply was not the binding throughput constraint at this scale. Every workload
+  shape — including read-only traffic that never takes an exclusive lock —
+  converged on the same throughput ceiling, and workers were measurably
+  CPU-quota-throttled throughout.
+
+That combination is the point: the component that looked expensive was not the one
+setting the limit, which removed the evidence basis for adding coordinator
+replication or sharding.
+
+**Limitations.** These are single-node `kind` measurements at development resource
+limits, on a host shared with MongoDB, the coordinator and the Datadog Agent. They
+support relative comparison and bottleneck attribution within this deployment. They
+are **not** production capacity, multi-node, availability or fault-tolerance claims;
+the report is explicit about what the evidence does not earn.
+
+Note that the older files directly under `benchmarks/` are separate **V1** evidence
+measuring process-local concurrency strategies over in-memory storage, and are not
+comparable with the distributed results above.
