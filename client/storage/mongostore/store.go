@@ -134,6 +134,58 @@ func (s *Store) Ping(ctx context.Context) error {
 	return nil
 }
 
+// ObjectIDs lists the logical UUIDs of every stored object.
+//
+// This is an administrative and diagnostic helper -- backup tooling,
+// operational inspection, and tamper tests. SAFER's own operations never
+// scan the collection: they address objects by UUIDs they derive
+// themselves.
+func (s *Store) ObjectIDs(ctx context.Context) ([]uuid.UUID, error) {
+	opCtx, cancel := withTimeout(ctx, s.timeout)
+	defer cancel()
+
+	cursor, err := s.objects.collection.Find(opCtx, bson.M{}, options.Find().SetProjection(bson.M{"_id": 1}))
+	if err != nil {
+		return nil, fmt.Errorf("mongostore: list object ids: %w", err)
+	}
+	defer cursor.Close(opCtx)
+
+	var ids []uuid.UUID
+	for cursor.Next(opCtx) {
+		var doc struct {
+			ID string `bson:"_id"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("mongostore: list object ids: %w", err)
+		}
+		id, err := uuid.Parse(doc.ID)
+		if err != nil {
+			return nil, fmt.Errorf("mongostore: list object ids: bad _id %q: %w", doc.ID, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("mongostore: list object ids: %w", err)
+	}
+	return ids, nil
+}
+
+// DropDatabase permanently deletes every SAFER object and key in this
+// store's database.
+//
+// It exists for test isolation and for operational teardown of a
+// throwaway database. It is destructive and irreversible; nothing in
+// SAFER's normal operation calls it.
+func (s *Store) DropDatabase(ctx context.Context) error {
+	opCtx, cancel := withTimeout(ctx, s.timeout)
+	defer cancel()
+
+	if err := s.objects.collection.Database().Drop(opCtx); err != nil {
+		return fmt.Errorf("mongostore: drop database: %w", err)
+	}
+	return nil
+}
+
 // Close releases the connection pool.
 func (s *Store) Close(ctx context.Context) error {
 	closeCtx, cancel := withTimeout(ctx, s.timeout)

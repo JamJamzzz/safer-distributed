@@ -1,3 +1,27 @@
+## SAFER Distributed
+
+This repository is the distributed evolution of SAFER-CC (V1), which remains the
+canonical single-process implementation. See
+[docs/distributed-roadmap.md](docs/distributed-roadmap.md) for the fork's origin,
+phase plan, and current limitations.
+
+Storage now sits behind an `ObjectStore`/`KeyStore` abstraction
+([client/storage](client/storage)) with two backends: the legacy in-memory `userlib`
+one (the default, preserving V1 behavior) and a durable MongoDB one
+([client/storage/mongostore](client/storage/mongostore)).
+
+To run the suite against MongoDB:
+
+```bash
+docker run -d -p 27017:27017 --name safer-mongo mongo:7
+SAFER_MONGO_URI=mongodb://localhost:27017 go test -count=1 ./...
+```
+
+Without `SAFER_MONGO_URI`, MongoDB integration tests skip cleanly and every other test
+still runs. MongoDB provides durable shared persistence only -- it is not the
+concurrency-control mechanism, and SAFER's locking is still process-local, so multiple
+workers sharing one database are not yet safely serialized.
+
 ## CI and concurrency verification
 
 To run all packages, including the white-box, black-box, lock-manager, and

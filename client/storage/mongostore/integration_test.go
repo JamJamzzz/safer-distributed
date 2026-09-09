@@ -69,7 +69,7 @@ func requireStore(t *testing.T) *Store {
 		t.Skipf("skipping: MongoDB at %s is unreachable: %v", cfg.URI, err)
 	}
 	t.Cleanup(func() {
-		if err := store.client.Database(cfg.Database).Drop(context.Background()); err != nil {
+		if err := store.DropDatabase(context.Background()); err != nil {
 			t.Errorf("dropping test database: %v", err)
 		}
 		if err := store.Close(context.Background()); err != nil {
@@ -296,7 +296,7 @@ func TestMongoDurabilityAcrossConnections(t *testing.T) {
 		t.Fatalf("reopening: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = reader.client.Database(cfg.Database).Drop(context.Background())
+		_ = reader.DropDatabase(context.Background())
 		_ = reader.Close(context.Background())
 	})
 

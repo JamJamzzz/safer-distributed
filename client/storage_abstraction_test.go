@@ -52,9 +52,8 @@ func (failingKeyStore) Put(ctx context.Context, name string, key userlib.PublicK
 // restores it afterwards. Specs run serially, so this does not race with
 // other specs.
 func withStorage(s storage.Storage, fn func()) {
-	previous := activeStorage
-	activeStorage = s
-	defer func() { activeStorage = previous }()
+	restore := UseStorage(s)
+	defer restore()
 	fn()
 }
 
@@ -62,8 +61,8 @@ var _ = Describe("Storage abstraction", func() {
 	Specify("SAFER's default backend is the legacy userlib one", func() {
 		// V1 behavior must remain the default until a backend is
 		// explicitly substituted.
-		Expect(activeStorage.Objects).To(BeAssignableToTypeOf(&storage.UserlibObjectStore{}))
-		Expect(activeStorage.Keys).To(BeAssignableToTypeOf(&storage.UserlibKeyStore{}))
+		Expect(currentStorage().Objects).To(BeAssignableToTypeOf(&storage.UserlibObjectStore{}))
+		Expect(currentStorage().Keys).To(BeAssignableToTypeOf(&storage.UserlibKeyStore{}))
 	})
 
 	Specify("wrappers round-trip through whatever backend is installed", func() {

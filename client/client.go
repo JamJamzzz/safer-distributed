@@ -138,7 +138,45 @@ func someUsefulThings() {
 // Those latches protect userlib's unsynchronized Go maps; they are not
 // SAFER transaction semantics and must not be inherited by future
 // backends. See client/storage/userlib_store.go for the full rationale.
-var activeStorage = storage.NewUserlibStorage()
+//
+// The handle is atomic because a deployment installs its backend at
+// startup while SAFER operations may already be running in other
+// goroutines; a plain global would be a data race on every storage call.
+var activeStorage atomic.Pointer[storage.Storage]
+
+func init() {
+	UseUserlibStorage()
+}
+
+// currentStorage returns the installed backend.
+func currentStorage() storage.Storage { return *activeStorage.Load() }
+
+// UseStorage installs the storage backend SAFER operations use, and
+// returns a function that restores the previous one.
+//
+// It is intended to be called once at process startup, before any SAFER
+// operation runs: switching backends underneath in-flight operations would
+// leave a transaction reading one store and writing another. Tests use the
+// returned restore function to put the default back.
+//
+// Installing a backend changes only where bytes live. Encryption, MAC,
+// authorization, Namespace/File resources, and strict 2PL are unaffected
+// -- and note that a shared backend does NOT by itself make SAFER safe
+// across processes: locking is still process-local until the Phase 3 lock
+// coordinator exists.
+func UseStorage(s storage.Storage) (restore func()) {
+	if s.Objects == nil || s.Keys == nil {
+		panic("client: UseStorage requires both an ObjectStore and a KeyStore")
+	}
+	previous := activeStorage.Swap(&s)
+	return func() { activeStorage.Store(previous) }
+}
+
+// UseUserlibStorage installs the legacy in-memory userlib backend, which
+// is the default: process-local and not durable.
+func UseUserlibStorage() (restore func()) {
+	return UseStorage(storage.NewUserlibStorage())
+}
 
 // storageContext is the context SAFER's storage calls carry today.
 //
@@ -163,23 +201,23 @@ func storageContext() context.Context { return context.Background() }
 // deadlines through the public SAFER API would change that API and is not
 // part of this change.
 func datastoreGet(id uuid.UUID) ([]byte, bool, error) {
-	return activeStorage.Objects.Get(storageContext(), id)
+	return currentStorage().Objects.Get(storageContext(), id)
 }
 
 func datastoreSet(id uuid.UUID, value []byte) error {
-	return activeStorage.Objects.Put(storageContext(), id, value)
+	return currentStorage().Objects.Put(storageContext(), id, value)
 }
 
 func datastoreDelete(id uuid.UUID) error {
-	return activeStorage.Objects.Delete(storageContext(), id)
+	return currentStorage().Objects.Delete(storageContext(), id)
 }
 
 func keystoreGet(name string) (userlib.PublicKeyType, bool, error) {
-	return activeStorage.Keys.Get(storageContext(), name)
+	return currentStorage().Keys.Get(storageContext(), name)
 }
 
 func keystoreSet(name string, key userlib.PublicKeyType) error {
-	return activeStorage.Keys.Put(storageContext(), name, key)
+	return currentStorage().Keys.Put(storageContext(), name, key)
 }
 
 // ---------------------------------------------------------------------

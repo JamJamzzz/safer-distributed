@@ -73,11 +73,10 @@ V1 is correct and well tested **within one process**. Its two structural limits:
     the first task of Phase 2, done against a backend that can actually fail.
   - Storage calls carry `context.Background()`. Threading per-operation contexts
     through the public SAFER API would change that API, which Phase 1 does not.
-- **Phase 2 — MongoDB backend.** Next. Shared durable persistence of the *same* encrypted,
-  authenticated blobs under the *same* logical UUIDs. Minimal schema (`objects`,
-  `public_keys`), configuration via environment, integration tests that skip cleanly
-  when MongoDB is absent. MongoDB is persistence only — **not** the concurrency-control
-  mechanism.
+- **Phase 2 — MongoDB backend.** Done. `client/storage/mongostore` implements the
+  Phase 1 interfaces on MongoDB, and `client.UseStorage` installs a backend at
+  startup. See "Running SAFER on MongoDB" below.
+
 - **Phase 3 — Remote coordination.** A single Lock Coordinator wrapping the existing
   generic `LockManager` core, reached over gRPC by multiple SAFER workers. Small,
   strict-2PL-oriented surface: `BeginTransaction`, `Acquire`, `RenewLease`,
@@ -93,12 +92,84 @@ are preserved unchanged across every phase.
 Kafka, Redis, Raft/Paxos or any custom consensus, hand-rolled 2PC, MongoDB sharding,
 multi-region deployment, MVCC, and distributed lock sharding.
 
+## Running SAFER on MongoDB
+
+```bash
+docker run -d -p 27017:27017 --name safer-mongo mongo:7
+SAFER_MONGO_URI=mongodb://localhost:27017 go test ./...
+```
+
+Configuration comes from the environment; no credentials are hard-coded and there is
+no default URI, so a missing `SAFER_MONGO_URI` is an error rather than a silent
+connection to some default host.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SAFER_MONGO_URI` | *(none)* | Connection string, including credentials. Unset means "no MongoDB configured". |
+| `SAFER_MONGO_DB` | `safer` | Database name. |
+| `SAFER_MONGO_TIMEOUT` | `10s` | Bounds connect and per-operation work when the caller has no deadline. Accepts `30` as well as `30s`. |
+
+A process opts in explicitly:
+
+```go
+store, err := mongostore.Open(ctx, cfg)
+restore := client.UseStorage(store.Storage())
+```
+
+The default backend remains the in-memory `userlib` one, so V1 behavior is what you
+get unless a backend is installed deliberately.
+
+### Schema
+
+```
+objects      { _id: "<uuid>", value: <binary> }
+public_keys  { _id: "<key name>", key_type: "PKE"|"DS", public_key: <PKIX DER> }
+```
+
+Objects are addressed by the same logical UUIDs SAFER already derives, and hold the
+encrypted, authenticated envelope verbatim. MongoDB sees ciphertext and nothing else:
+the cryptographic object layout was not redesigned to look more database-like. Key
+registration is write-once, enforced by the unique `_id` index, so SAFER's identity
+semantics now hold across every worker rather than within one process. No sharding, no
+additional indexes.
+
+### What MongoDB is not
+
+MongoDB is persistence. It performs no locking on SAFER's behalf and knows nothing
+about SAFER's logical resources. Strict 2PL, S/X locks, and FIFO fairness remain in
+SAFER's lock layer, which is still process-local. Two SAFER workers sharing one
+MongoDB are **not** safely serialized today; that is exactly what Phase 3 is for.
+
+The userlib backend's global datastore latch is deliberately not carried over. It
+exists because userlib's Go maps are unsynchronized in-process state; imposing it here
+would serialize a backend whose purpose is concurrent shared access, and would not
+coordinate anything across processes anyway.
+
+### Known limitation: multi-object writes are not atomic
+
+Several SAFER operations write several objects in sequence (file creation writes a
+chunk, metadata, an access box, a status record, a structure record, and a namespace
+entry). With the `userlib` backend these writes could not fail. With MongoDB they can,
+and there is currently no transaction around them: a backend failure part-way through
+leaves some objects written and others not.
+
+This is a real gap, not a theoretical one. The operation reports the error rather than
+claiming success, and SAFER's authenticated envelopes mean a partial write cannot be
+passed off as valid content — but the stored state can be left incomplete. Wrapping
+these sequences in MongoDB transactions is the natural next storage-layer step; it
+needs a replica set, since standalone `mongod` does not support them.
+
 ## Claims not yet earned
 
 Recorded here so they are not asserted prematurely:
 
-- **No distributed correctness claim** — there are no cross-process tests yet.
-- **No durability claim** — storage is still the in-memory `userlib` maps.
-- **No fault-tolerance claim** — there are no failure-injection tests yet.
+- **No distributed correctness claim** — locking is still process-local, and there are
+  no cross-process tests. A shared database does not make concurrent workers safe.
+- **Durability, narrowly.** Verified: data written through one SAFER client and
+  connection pool is readable through a separate one afterwards, which is what a worker
+  restart looks like from storage's point of view. Not verified: crash consistency, or
+  behavior under a mid-operation failure — see the atomicity limitation above.
+- **No fault-tolerance claim** — the only failure tests are an injected failing backend
+  and an unreachable one. There is no kill-the-database or partition testing.
 - The checked-in benchmark tables are inherited historical SAFER-CC measurements, not
   performance claims about this repository.
