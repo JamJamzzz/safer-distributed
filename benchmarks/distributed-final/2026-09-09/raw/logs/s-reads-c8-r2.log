@@ -1,0 +1,4 @@
+Defaulted container "loadgen" out of: loadgen, datadog-lib-ruby-init (init), datadog-lib-python-init (init), datadog-lib-php-init (init), datadog-lib-js-init (init), datadog-lib-java-init (init), datadog-lib-dotnet-init (init), datadog-init-apm-inject (init)
+workload=reads attempted=500 succeeded=500 failed=0 elapsed=33.714s throughput=14.8 ops/s
+latency_samples=500 p50=517.837ms p95=1.046104s p99=1.196478s
+replicas_served=3 map[safer-worker-696879b4cb-2nl2c-1:167 safer-worker-696879b4cb-hgnfg-1:167 safer-worker-696879b4cb-m8c8s-1:168]

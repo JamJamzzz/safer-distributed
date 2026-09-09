@@ -1,0 +1,10 @@
+name=s-mixed-c8-r2
+workload=mixed
+concurrency=8
+mode=count
+value=500
+utc_start=2026-09-09T09:28:23.212Z
+utc_end=2026-09-09T09:29:30.360Z
+job_status=succeeded
+restarts_before=safer-worker-696879b4cb-2nl2c=0 safer-worker-696879b4cb-hgnfg=0 safer-worker-696879b4cb-m8c8s=0 
+restarts_after=safer-worker-696879b4cb-2nl2c=0 safer-worker-696879b4cb-hgnfg=0 safer-worker-696879b4cb-m8c8s=0 

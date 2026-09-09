@@ -1,0 +1,10 @@
+name=s-reads-c8-r1
+workload=reads
+concurrency=8
+mode=count
+value=500
+utc_start=2026-09-09T09:30:46.766Z
+utc_end=2026-09-09T09:31:46.687Z
+job_status=succeeded
+restarts_before=safer-worker-696879b4cb-2nl2c=0 safer-worker-696879b4cb-hgnfg=0 safer-worker-696879b4cb-m8c8s=0 
+restarts_after=safer-worker-696879b4cb-2nl2c=0 safer-worker-696879b4cb-hgnfg=0 safer-worker-696879b4cb-m8c8s=0 

@@ -1,0 +1,59 @@
+# A one-shot Job, not a Deployment: loadgen runs a fixed amount of work
+# and exits (non-zero if it saw any errors -- see cmd/loadgen/main.go),
+# which is exactly a Job's shape and not a long-running service's.
+#
+# It targets the worker HEADLESS Service (worker-service-headless.yaml)
+# through gRPC's "dns:///" scheme, NOT the plain ClusterIP worker Service.
+# That distinction is load-bearing, not stylistic: pointed at the ClusterIP
+# Service, this loadgen would talk to exactly one worker pod for its whole
+# run -- see worker-service-headless.yaml and cmd/loadgen/dial.go for why.
+# Check the Job's log output for a "replicas_served=" line with more than
+# one entry to confirm this actually happened, rather than assuming it did
+# because more than one worker replica exists.
+#
+#   kubectl apply -f deploy/kubernetes/loadgen-job.yaml
+#   kubectl logs -n safer-distributed job/safer-loadgen -f
+#   kubectl delete -f deploy/kubernetes/loadgen-job.yaml   # before re-running
+#
+# The safer-client: "true" pod label is what networkpolicy.yaml's
+# worker-ingress rule actually admits -- see that file's header comment
+# for why worker ingress is scoped to labeled clients rather than the
+# whole namespace. Any other real caller in this namespace needs the same
+# label on its own pod template to reach the worker Service at all.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: s-reads-c8-r2
+  namespace: safer-distributed
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        safer-client: "true"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: safer-loadgen:local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            # Telemetry-backend configuration, deliberately a separate
+            # ConfigMap -- see deploy/kubernetes/telemetry/otel-config.yaml
+            # and worker-deployment.yaml's matching comment. Optional: its
+            # absence just means no telemetry is exported.
+            - configMapRef:
+                name: safer-otel-config
+                optional: true
+          args:
+            - "-addr=dns:///safer-worker-headless:50052"
+            - "-workload=reads"
+            - "-concurrency=8"
+            - "-count=500"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

@@ -1,0 +1,10 @@
+name=p-sf-c1-r1
+workload=same-file-writes
+concurrency=1
+mode=count
+value=500
+utc_start=2026-09-09T08:57:24.169Z
+utc_end=2026-09-09T08:58:43.715Z
+job_status=succeeded
+restarts_before=safer-worker-696879b4cb-2nl2c=0 safer-worker-696879b4cb-hgnfg=0 safer-worker-696879b4cb-m8c8s=0 
+restarts_after=safer-worker-696879b4cb-2nl2c=0 safer-worker-696879b4cb-hgnfg=0 safer-worker-696879b4cb-m8c8s=0 

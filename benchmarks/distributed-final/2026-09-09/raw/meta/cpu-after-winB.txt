@@ -1,0 +1,3 @@
+safer-worker-696879b4cb-2nl2c nr_periods=18065 nr_throttled=10159 throttled_usec=1504298429 usage_usec=617392187
+safer-worker-696879b4cb-hgnfg nr_periods=17550 nr_throttled=10699 throttled_usec=2205117691 usage_usec=608502696
+safer-worker-696879b4cb-m8c8s nr_periods=17529 nr_throttled=9607 throttled_usec=1420028316 usage_usec=584566138
