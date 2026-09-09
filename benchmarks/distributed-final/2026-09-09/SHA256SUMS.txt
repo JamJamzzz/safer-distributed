@@ -1,5 +1,5 @@
 8adc2b7bdb22d502f57695ead3bb7233299f3d1cd38fc72f8523ea9cbdf0702f *.gitattributes
-b152849e42a6ba71fb1df27ced206141c870a194ebb377f6149498bd7cd21c99 *README.md
+caa4cf6e63fe21a4d7698e1e8e36fbf6f08888aa58edb45c3bf2031b2ecbeae0 *README.md
 5b67c4b1d944045d5623b11b81c9f4e38ed2f8ad91ca67a55ea1135a8a293097 *final-campaign-report.md
 1f75f9c661d7fd64ac127f70cb2c44d84f997ef860c8382816b009153ea3d3aa *raw/logs/attrib-A-ind-c8-120s.log
 f12a9e904b7a2aefb68dad6754e68399af866e3020d2536408b516c85ae8061e *raw/logs/attrib-win-a-ind-c8-120s.log
