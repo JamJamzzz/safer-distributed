@@ -92,20 +92,34 @@ docker run --rm --network safer-net safer-loadgen:local \
 Run while building Phase 4.5, this produced:
 
 ```
-workload=mixed completed=80 errors=0 elapsed=1.859s throughput=43.0 ops/s
-replicas_served=3 map[55999889c40a-1:32 b7ea5b705011-1:32 cb56c2969577-1:32]
+workload=mixed attempted=80 succeeded=80 failed=0 elapsed=1.853s throughput=43.2 ops/s
+replicas_served=3 map[6965216501c4-1:31 953e10d280f3-1:33 a85adadc3243-1:32]
 ```
 
 `replicas_served=3` -- read from the response-header instance identifier
 `cmd/worker` attaches to every RPC (`internal/workerdiag`,
 `cmd/worker/instance.go`), not assumed from how many containers were
-started -- with an almost perfectly even 32/32/32 split, confirms the
-`dns:///` + `round_robin` mechanism actually spreads load across distinct
-worker processes. Pointing loadgen at a single worker's own address (or,
-before Phase 4.5, at a container reached through one pinned connection)
-would show `replicas_served=1` instead; that was the gap this evidence
-closes. See `deploy/kubernetes/README.md` for why the plain `worker-service.yaml`
+started -- with a near-even 31/32/33 split, confirms the `dns:///` +
+`round_robin` mechanism actually spreads load across distinct worker
+processes. Pointing loadgen at a single worker's own address (or, before
+Phase 4.5, at a container reached through one pinned connection) would
+show `replicas_served=1` instead; that was the gap this evidence closes.
+See `deploy/kubernetes/README.md` for why the plain `worker-service.yaml`
 ClusterIP Service does not give you this on its own.
+
+`succeeded=80 failed=0` alone is not evidence the writes actually landed
+correctly -- an RPC reporting success says nothing about whether a
+concurrent write silently clobbered it. `attempted`/`succeeded`/`failed`
+count RPC outcomes; the absence of a `DATA CORRUPTION` line is the
+separate, actual data check (`cmd/loadgen/workload.go`'s `checkOracles`):
+for write workloads, every user's final file length must equal its
+initial length plus one `-content-size`-sized chunk per successful
+append that user made, verified with a `LoadFile` after the run, and
+`WorkloadReads` verifies every single read's bytes inline as it happens.
+A lost or duplicated write changes the length; a wrong read is caught the
+moment it comes back. Either failure exits non-zero, and prints under
+`DATA CORRUPTION` rather than being folded into `failed`, which counts
+RPC errors, not this.
 
 ## What is deliberately not here
 

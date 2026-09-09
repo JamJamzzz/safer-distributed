@@ -562,6 +562,24 @@ part of SAFER's business API), and `cmd/loadgen`'s report includes a
 the build if a run against three real worker processes reports fewer than
 two.
 
+**A clean RPC error count is not a correctness claim, and the report no
+longer implies it is one.** The report now separates `attempted`,
+`succeeded`, and `failed` RPC outcomes -- a run that attempted 1000
+operations and failed 400 has succeeded at 600, not 1000, and throughput
+is computed from `succeeded` alone. More importantly, `succeeded` by
+itself never proved the data was actually right: an RPC can report success
+while a concurrent write silently clobbers it. `checkOracles`
+(`cmd/loadgen/workload.go`) is the actual data check, run once after the
+timed portion of a write workload: every user's file must, at the end, be
+exactly its initial content plus one `-content-size`-sized chunk per
+append this run recorded as successful for that user -- a lost or
+duplicated write changes that length and is caught. `WorkloadReads`
+verifies inline, on every single read, that the bytes returned are the
+only content the file has ever legitimately held. Either kind of failure
+prints under a `DATA CORRUPTION` line and exits the process non-zero,
+distinct from `failed`, which counts RPC errors, not data that disagrees
+with what the RPCs said happened.
+
 ### Evidence
 
 | Check | How |
@@ -570,7 +588,7 @@ two.
 | Worker refuses bad/missing config | `cmd/worker`'s `parseConfig` unit-tested: missing MongoDB, missing coordinator, missing both, non-positive timeouts |
 | Multiple worker replicas serve one deployment correctly | `integration/workerservice`: real worker and coordinator processes, `InitUser` on one replica, `StoreFile`/`AppendToFile`/`LoadFile` on others, for two independent users, against one MongoDB |
 | Readiness/liveness semantics | `integration/workerservice`: a live worker reports `SERVING` on both the default (readiness) and `"liveness"` gRPC health services |
-| Load generator drives worker replicas, and balancing is real, not assumed | `integration/workerservice`: all four workload types run against three real worker processes with zero errors, asserting `replicas_served >= 2` parsed from loadgen's own report; the `dns:///` + `round_robin` mechanism itself verified separately against three Docker containers sharing one DNS name -- `replicas_served=3`, an even 32/32/32 split (see `docker/README.md`) |
+| Load generator drives worker replicas, balancing is real, and the data is actually checked | `integration/workerservice`: all four workload types run against three real worker processes with zero failed RPCs and no correctness-oracle failure, asserting `replicas_served >= 2` parsed from loadgen's own report; the `dns:///` + `round_robin` mechanism itself verified separately against three Docker containers sharing one DNS name -- `replicas_served=3`, a near-even 31/32/33 split, `failed=0` and no `DATA CORRUPTION` line (see `docker/README.md`) |
 | Docker images build and interoperate | All three images built and smoke-tested together on a Docker network against a real MongoDB replica set (`docker/README.md`); now also built (not run) on every CI push (`.github/workflows/ci.yml`'s `docker` job) |
 | Kubernetes manifests are internally consistent | `deploy/kubernetes/manifest_test.go`: `kubectl kustomize` builds the full manifest set and the files intentionally excluded from it, catching a broken cross-reference (e.g. a Service selector that stops matching a Deployment's labels) |
 | Existing Phase 1-3C correctness | Full suite (`go test ./...`, with and without `SAFER_MONGO_URI`) re-run clean after every Phase 4 change, including `integration/crossprocess` and `integration/rollback_test.go` |

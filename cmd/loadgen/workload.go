@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -23,12 +24,20 @@ import (
 const callTimeout = 30 * time.Second
 
 // Report summarizes one run.
+//
+// Attempted, Succeeded, and Failed are kept distinct on purpose: a run
+// that attempted 1000 operations and failed 400 of them has a throughput
+// of 600 operations, not 1000, and reporting Attempted as if it were a
+// success count would overstate what actually happened -- exactly the
+// mistake a later performance-tuning pass could otherwise inherit.
 type Report struct {
-	Workload    Workload
-	Requested   int // Count, or 0 if the run was duration-bounded
-	Completed   int64
-	Errors      int64
-	Elapsed     time.Duration
+	Workload  Workload
+	Requested int // Count, or 0 if the run was duration-bounded
+	Attempted int64
+	Succeeded int64
+	Failed    int64
+	Elapsed   time.Duration
+
 	FirstErrors []string // up to a handful of distinct error messages, for diagnosis
 
 	// Replicas counts completed RPCs by the worker instance that served
@@ -38,24 +47,41 @@ type Report struct {
 	// than one worker process actually served this run, not just that
 	// more than one address was configured.
 	Replicas map[string]int64
+
+	// OracleFailures is non-empty when a completed run's actual data
+	// disagrees with what the recorded successful operations say should
+	// be there -- see checkOracles. A non-nil RPC error already means an
+	// operation failed; this catches the more dangerous case where every
+	// RPC reported success and the data is still wrong (a lost or
+	// duplicated write, or a read that returned the wrong bytes).
+	OracleFailures []string
 }
 
 func (r Report) String() string {
-	rate := float64(r.Completed) / r.Elapsed.Seconds()
-	s := fmt.Sprintf("workload=%s completed=%d errors=%d elapsed=%s throughput=%.1f ops/s",
-		r.Workload, r.Completed, r.Errors, r.Elapsed.Round(time.Millisecond), rate)
+	rate := float64(r.Succeeded) / r.Elapsed.Seconds()
+	s := fmt.Sprintf("workload=%s attempted=%d succeeded=%d failed=%d elapsed=%s throughput=%.1f ops/s",
+		r.Workload, r.Attempted, r.Succeeded, r.Failed, r.Elapsed.Round(time.Millisecond), rate)
 	s += fmt.Sprintf("\nreplicas_served=%d %v", len(r.Replicas), r.Replicas)
 	for _, e := range r.FirstErrors {
 		s += fmt.Sprintf("\n  error: %s", e)
 	}
+	for _, f := range r.OracleFailures {
+		s += fmt.Sprintf("\n  DATA CORRUPTION: %s", f)
+	}
 	return s
 }
 
-// user is one SAFER identity the run drives requests as.
+// user is one SAFER identity the run drives requests as. successfulAppends
+// is read and written with the atomic package, since several goroutines
+// can share one user (WorkloadSameFileWrites forces exactly one shared
+// user; independent-writes and mixed round-robin cfg.Users < cfg.Concurrency
+// callers over the same set).
 type user struct {
 	username string
 	password string
 	filename string
+
+	successfulAppends int64
 }
 
 // replicaTally counts, per worker instance, how many RPCs it actually
@@ -95,12 +121,12 @@ func (rt *replicaTally) snapshot() map[string]int64 {
 // before the timed run starts, so setup latency (InitUser is intentionally
 // expensive -- see client.InitUser -- and StoreFile is a full multi-object
 // mutation) is never counted as load.
-func setup(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, tally *replicaTally) ([]user, error) {
-	users := make([]user, cfg.Users)
+func setup(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, tally *replicaTally) ([]*user, error) {
+	users := make([]*user, cfg.Users)
 	initialContent := make([]byte, cfg.ContentSize)
 
 	for i := range users {
-		u := user{
+		u := &user{
 			username: fmt.Sprintf("loadgen-%d-%d", time.Now().UnixNano(), i),
 			password: fmt.Sprintf("password-%d", i),
 			filename: "loadgen.dat",
@@ -133,14 +159,20 @@ func setup(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, t
 // caller its own user (round-robin over cfg.Users, which may be fewer than
 // cfg.Concurrency), while same-file-writes and reads use the single shared
 // user every caller was already forced onto in parseConfig.
-func callerUser(users []user, callerIndex int) user {
+func callerUser(users []*user, callerIndex int) *user {
 	return users[callerIndex%len(users)]
 }
 
 // runOne performs a single operation for the given caller against its
-// user, per the workload's definition, records which replica served it,
-// and reports whether it succeeded.
-func runOne(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, tally *replicaTally, u user, content []byte) error {
+// user, per the workload's definition, records which replica served it
+// and, for a successful append, that it happened (u.successfulAppends is
+// the oracle in checkOracles' input) -- and, for a read, checks the
+// returned content against the one value this workload's file can ever
+// legitimately hold, since WorkloadReads never mutates anything after
+// setup. It returns an error for either an RPC failure or a read that
+// came back wrong; both are real correctness failures a caller cares
+// about, whatever the RPC status said.
+func runOne(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, tally *replicaTally, u *user, content, initialContent []byte) error {
 	var header metadata.MD
 	var err error
 
@@ -149,15 +181,26 @@ func runOne(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, 
 		_, err = client.AppendToFile(ctx, &workerv1.AppendToFileRequest{
 			Username: u.username, Password: u.password, Filename: u.filename, Content: content,
 		}, grpc.Header(&header))
+		if err == nil {
+			atomic.AddInt64(&u.successfulAppends, 1)
+		}
 	case WorkloadReads:
-		_, err = client.LoadFile(ctx, &workerv1.LoadFileRequest{
+		var resp *workerv1.LoadFileResponse
+		resp, err = client.LoadFile(ctx, &workerv1.LoadFileRequest{
 			Username: u.username, Password: u.password, Filename: u.filename,
 		}, grpc.Header(&header))
+		if err == nil && !bytes.Equal(resp.GetContent(), initialContent) {
+			err = fmt.Errorf("read returned %d bytes not matching the file's only ever-written content (%d bytes)",
+				len(resp.GetContent()), len(initialContent))
+		}
 	case WorkloadMixed:
 		if rand.Intn(2) == 0 {
 			_, err = client.AppendToFile(ctx, &workerv1.AppendToFileRequest{
 				Username: u.username, Password: u.password, Filename: u.filename, Content: content,
 			}, grpc.Header(&header))
+			if err == nil {
+				atomic.AddInt64(&u.successfulAppends, 1)
+			}
 		} else {
 			_, err = client.LoadFile(ctx, &workerv1.LoadFileRequest{
 				Username: u.username, Password: u.password, Filename: u.filename,
@@ -169,6 +212,63 @@ func runOne(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, 
 
 	tally.record(header)
 	return err
+}
+
+// checkOracles is what makes this tool's correctness claim real rather
+// than assumed from RPC status codes.
+//
+// For any workload that writes (independent-writes, same-file-writes,
+// mixed), every user's file must, after the run, be exactly its initial
+// content plus one contentSize-sized chunk per append this run recorded
+// as successful for that user:
+//
+//	final length = initial length + successful append count * append size
+//
+// A silent lost update -- an append whose RPC reported success but whose
+// bytes never actually landed, or that a concurrent write clobbered --
+// changes the file's length and is caught here. This is the one point in
+// the tool that asks "is the data really there", instead of only "did the
+// RPC return an error"; nothing about a clean error count from run()
+// implies the data is correct without this also passing.
+//
+// WorkloadReads needs no separate check here: runOne already verifies
+// every read inline (a mismatch there is a Failed RPC, exactly where it
+// belongs, not a separate oracle pass), since a read that returns the
+// wrong bytes is detected the moment it happens, with no need to wait for
+// the run to finish.
+func checkOracles(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, users []*user) []string {
+	if cfg.Workload == WorkloadReads {
+		return nil
+	}
+
+	seen := make(map[string]bool, len(users))
+	var failures []string
+	for _, u := range users {
+		if seen[u.username] {
+			continue
+		}
+		seen[u.username] = true
+
+		successes := atomic.LoadInt64(&u.successfulAppends)
+		want := int64(cfg.ContentSize) + successes*int64(cfg.ContentSize)
+
+		loadCtx, cancel := context.WithTimeout(ctx, callTimeout)
+		resp, err := client.LoadFile(loadCtx, &workerv1.LoadFileRequest{
+			Username: u.username, Password: u.password, Filename: u.filename,
+		})
+		cancel()
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("user %s: verifying final content: %v", u.username, err))
+			continue
+		}
+
+		if got := int64(len(resp.GetContent())); got != want {
+			failures = append(failures, fmt.Sprintf(
+				"user %s: file is %d bytes, want %d (initial %d + %d successful append(s) x %d bytes)",
+				u.username, got, want, cfg.ContentSize, successes, cfg.ContentSize))
+		}
+	}
+	return failures
 }
 
 // run executes cfg's workload against conn and returns a Report.
@@ -187,8 +287,9 @@ func run(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report, error)
 	}
 
 	content := make([]byte, cfg.ContentSize)
+	initialContent := make([]byte, cfg.ContentSize) // all-zero, exactly what setup wrote
 
-	var completed, failed int64
+	var attempted, succeeded, failed int64
 	var errMu sync.Mutex
 	var firstErrors []string
 	recordErr := func(err error) {
@@ -225,26 +326,36 @@ func run(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report, error)
 				}
 
 				callCtx, cancel := context.WithTimeout(ctx, callTimeout)
-				err := runOne(callCtx, cfg, client, tally, u, content)
+				err := runOne(callCtx, cfg, client, tally, u, content, initialContent)
 				cancel()
 
-				atomic.AddInt64(&completed, 1)
+				atomic.AddInt64(&attempted, 1)
 				if err != nil {
 					atomic.AddInt64(&failed, 1)
 					recordErr(err)
+				} else {
+					atomic.AddInt64(&succeeded, 1)
 				}
 			}
 		}(i)
 	}
 	wg.Wait()
+	elapsed := time.Since(start)
+
+	// Oracle verification happens after the timed run, exactly like
+	// setup: it is a correctness check, not load, and must not be
+	// counted as either.
+	oracleFailures := checkOracles(ctx, cfg, client, users)
 
 	return Report{
-		Workload:    cfg.Workload,
-		Requested:   cfg.Count,
-		Completed:   completed,
-		Errors:      failed,
-		Elapsed:     time.Since(start),
-		FirstErrors: firstErrors,
-		Replicas:    tally.snapshot(),
+		Workload:       cfg.Workload,
+		Requested:      cfg.Count,
+		Attempted:      attempted,
+		Succeeded:      succeeded,
+		Failed:         failed,
+		Elapsed:        elapsed,
+		FirstErrors:    firstErrors,
+		Replicas:       tally.snapshot(),
+		OracleFailures: oracleFailures,
 	}, nil
 }

@@ -123,8 +123,11 @@ func TestLoadgenDrivesWorkerService(t *testing.T) {
 			if err != nil {
 				t.Fatalf("loadgen -workload %s failed: %v\n%s", workload, err, output)
 			}
-			if !strings.Contains(string(output), "errors=0") {
-				t.Errorf("loadgen -workload %s reported errors:\n%s", workload, output)
+			if !strings.Contains(string(output), "failed=0") {
+				t.Errorf("loadgen -workload %s reported failures:\n%s", workload, output)
+			}
+			if strings.Contains(string(output), "DATA CORRUPTION") {
+				t.Errorf("loadgen -workload %s failed its own correctness oracle:\n%s", workload, output)
 			}
 
 			replicasServed := parseReplicasServed(t, string(output))
