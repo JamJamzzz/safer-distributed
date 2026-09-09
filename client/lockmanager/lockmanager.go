@@ -28,6 +28,7 @@
 package lockmanager
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -87,6 +88,14 @@ type TxnID uint64
 type lockRequest struct {
 	txn  TxnID
 	mode LockMode
+
+	// cancelled is set (under lm.mu) when the waiter's context is done.
+	// sync.Cond.Wait cannot itself be interrupted, so cancellation is
+	// delivered as state plus a Broadcast: the watcher marks the request
+	// and wakes the resource, and the waiting goroutine observes the flag
+	// when it re-checks. Only AcquireContext callers can ever see this
+	// set; a plain Acquire has no context to cancel.
+	cancelled bool
 }
 
 // lockState is the per-resource bookkeeping record.
@@ -138,8 +147,44 @@ func NewLockManager() *LockManager {
 // correctly handle spurious wakeups) only when the resource's holder/queue
 // state changes.
 func (lm *LockManager) Acquire(txn TxnID, resource ResourceID, mode LockMode) error {
+	// context.Background() has a nil Done channel, so this takes exactly
+	// the same code path Acquire always did: no watcher goroutine, no
+	// cancellation checks that can ever fire.
+	return lm.AcquireContext(context.Background(), txn, resource, mode)
+}
+
+// AcquireContext is Acquire, with the wait made cancellable.
+//
+// It exists because a remote caller can disappear. The RPC coordinator
+// serves each Acquire under the caller's context; when that caller
+// disconnects or gives up, the request must leave the wait queue. A
+// request that stayed queued would eventually reach the front and be
+// granted to a transaction nobody is driving any more -- a ghost lock,
+// blocking every later transaction on that resource until something
+// external cleaned it up.
+//
+// Cancellation is checked before the grant test on every wake, so a
+// request whose context is already done is never granted even if the
+// resource happened to become available at the same moment.
+//
+// There is one unavoidable ordering: a context can be cancelled in the
+// instant after a grant has been decided and before the caller learns of
+// it. AcquireContext returns nil in that case -- the lock really is held,
+// and pretending otherwise would leak it. Callers must therefore always
+// end their transaction (see the coordinator's EndTransaction path, which
+// runs even when Acquire's response never arrives).
+//
+// A cancelled request returns ctx.Err() and holds no lock.
+func (lm *LockManager) AcquireContext(ctx context.Context, txn TxnID, resource ResourceID, mode LockMode) error {
+	if ctx == nil {
+		return errors.New("lockmanager: nil context")
+	}
 	if mode != SharedLock && mode != ExclusiveLock {
 		return errors.New("lockmanager: invalid lock mode")
+	}
+	// Never enqueue a request that is already doomed.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	lm.mu.Lock()
@@ -167,8 +212,50 @@ func (lm *LockManager) Acquire(txn TxnID, resource ResourceID, mode LockMode) er
 	req := &lockRequest{txn: txn, mode: mode}
 	ls.queue = append(ls.queue, req)
 
-	for !ls.canGrant(req) {
+	// Watch for cancellation only when the context can actually be
+	// cancelled. context.Background() has a nil Done channel, so plain
+	// Acquire spawns nothing and behaves exactly as it always has.
+	if done := ctx.Done(); done != nil {
+		stopWatching := make(chan struct{})
+		defer close(stopWatching)
+		go func() {
+			select {
+			case <-done:
+				lm.mu.Lock()
+				req.cancelled = true
+				// Wake this resource's waiters so the cancelled one
+				// re-checks and unwinds.
+				ls.cond.Broadcast()
+				lm.mu.Unlock()
+			case <-stopWatching:
+			}
+		}()
+	}
+
+	for {
+		// Cancellation is checked first, so a request whose context is
+		// done is never granted even if the resource is free.
+		if req.cancelled {
+			ls.removeFromQueue(req)
+			// Removing a queued request changes the "what is ahead of
+			// me" answer for everything behind it, exactly as a grant
+			// does; those waiters must re-check.
+			ls.cond.Broadcast()
+			lm.sweepIfIdle(resource, ls)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return context.Canceled
+		}
+		if ls.canGrant(req) {
+			break
+		}
 		ls.cond.Wait()
+		if hook := testHookAfterWake; hook != nil {
+			// Runs with lm.mu held, immediately after a wake and before
+			// the re-check above. Test-only; nil in production.
+			hook(lm)
+		}
 	}
 
 	ls.removeFromQueue(req)
@@ -300,11 +387,34 @@ func (lm *LockManager) releaseLocked(txn TxnID, resource ResourceID) error {
 	// goroutine would never be woken by. We accept retaining a handful of
 	// transiently-empty-but-briefly-not-yet-swept records in exchange for
 	// never risking that class of bug.
+	lm.sweepIfIdle(resource, ls)
+
+	return nil
+}
+
+// testHookAfterWake, when non-nil, is invoked with lm.mu held immediately
+// after a waiting request wakes and before it re-checks its cancellation
+// and grant predicates.
+//
+// It exists so tests can construct the one interleaving that cannot be
+// produced from outside the package: a request whose context was
+// cancelled AND whose resource became free in the same wake. That
+// coincidence is exactly what the cancellation-before-grant check
+// protects against, and without a hook a test can only ever observe the
+// easy case where the resource is still held. Always nil in production.
+var testHookAfterWake func(lm *LockManager)
+
+// sweepIfIdle reclaims a resource's lock-state record once nothing holds
+// it and nothing is waiting on it. Callers must hold lm.mu.
+//
+// The record must NOT be reclaimed while a request is still queued: that
+// waiter is blocked on THIS *sync.Cond specifically, and a later Acquire
+// for the same resource key would create a fresh lockState whose
+// Broadcasts would never reach the stranded goroutine.
+func (lm *LockManager) sweepIfIdle(resource ResourceID, ls *lockState) {
 	if !ls.hasExclusive && len(ls.sharedHolders) == 0 && len(ls.queue) == 0 {
 		delete(lm.resources, resource)
 	}
-
-	return nil
 }
 
 // ReleaseAll releases every lock currently held by txn. It acquires lm.mu
@@ -363,6 +473,11 @@ func NewLockGuard(lm *LockManager, txn TxnID) *LockGuard {
 // Acquire acquires mode on resource on behalf of the guard's transaction.
 func (g *LockGuard) Acquire(resource ResourceID, mode LockMode) error {
 	return g.lm.Acquire(g.txn, resource, mode)
+}
+
+// AcquireContext is Acquire with a cancellable wait.
+func (g *LockGuard) AcquireContext(ctx context.Context, resource ResourceID, mode LockMode) error {
+	return g.lm.AcquireContext(ctx, g.txn, resource, mode)
 }
 
 // ReleaseAll releases every lock held by the guard's transaction. Safe to
