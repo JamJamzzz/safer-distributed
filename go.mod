@@ -1,4 +1,4 @@
-module github.com/cs161-staff/project2-starter-code
+module github.com/JamJamzzz/safer-distributed
 
 go 1.20
 

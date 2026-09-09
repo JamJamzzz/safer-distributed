@@ -19,7 +19,7 @@ import (
 	userlib "github.com/cs161-staff/project2-userlib"
 	"github.com/google/uuid"
 
-	"github.com/cs161-staff/project2-starter-code/client/storage"
+	"github.com/JamJamzzz/safer-distributed/client/storage"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"

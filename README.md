@@ -46,10 +46,12 @@ list before testing. `-count=1` disables test-result caching and
 tests; they are not performance thresholds.
 
 The original Windows environment lacked a C compiler and had cgo disabled.
-The full race suite passed on Linux after fixing a shared datastore
-bandwidth-counter race, in
+The full race suite first passed on Linux after fixing a shared datastore
+bandwidth-counter race, in SAFER-CC's
 [hosted run 33740706536](https://github.com/JamJamzzz/safer-with-concurrency-control/actions/runs/33740706536)
-(Go 1.20.14, GCC 13.3.0). Linux CI supplies the missing toolchain; it does
+(Go 1.20.14, GCC 13.3.0) -- that link is V1 evidence in the upstream
+repository, not a run of this one; this repository's own runs are linked
+below. Linux CI supplies the missing toolchain; it does
 not change the local Windows environment. See
 [the evidence/status section](review.md#8-race-detector-evidencestatus).
 To reproduce the race command locally, use Linux with Go and GCC (or another
@@ -65,7 +67,7 @@ throughput/latency gates or GitHub-runner performance evidence.
 The checked-in benchmark tables predate the datastore race fix and are
 historical measurements, not current-code performance claims.
 
-[Latest main-branch CI runs](https://github.com/JamJamzzz/safer-with-concurrency-control/actions/workflows/ci.yml?query=branch%3Amain)
+[Latest main-branch CI runs](https://github.com/JamJamzzz/safer-distributed/actions/workflows/ci.yml?query=branch%3Amain)
 
 ## Concurrency benchmark
 

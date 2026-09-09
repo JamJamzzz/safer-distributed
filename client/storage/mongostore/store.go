@@ -16,7 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 
-	"github.com/cs161-staff/project2-starter-code/client/storage"
+	"github.com/JamJamzzz/safer-distributed/client/storage"
 )
 
 // Store is a MongoDB-backed SAFER storage backend. It is safe for

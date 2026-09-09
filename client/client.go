@@ -27,8 +27,8 @@ import (
 	userlib "github.com/cs161-staff/project2-userlib"
 	"github.com/google/uuid"
 
-	"github.com/cs161-staff/project2-starter-code/client/lockmanager"
-	"github.com/cs161-staff/project2-starter-code/client/storage"
+	"github.com/JamJamzzz/safer-distributed/client/lockmanager"
+	"github.com/JamJamzzz/safer-distributed/client/storage"
 
 	// hex.EncodeToString(...) is useful for converting []byte to string
 

@@ -56,3 +56,63 @@ jobs:
           go list ./...
       - name: Race-test all packages (uncached)
         run: go test -race -mod=readonly -count=1 -v -timeout=15m ./...
+
+  mongodb:
+    name: MongoDB integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: '0'
+      SAFER_MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      # Run MongoDB as a single-node replica set rather than a standalone
+      # server. A standalone mongod cannot serve multi-document
+      # transactions, and the next storage phase needs them for SAFER's
+      # multi-object writes. A single node is not replication or fault
+      # tolerance; it only enables the transaction machinery.
+      - name: Start MongoDB single-node replica set
+        run: |
+          docker run -d --name safer-mongo -p 27017:27017 \
+            mongo:7 --replSet rs0 --bind_ip_all
+          for i in $(seq 1 60); do
+            if docker exec safer-mongo mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$i" = "60" ]; then echo "mongod did not become reachable"; docker logs safer-mongo; exit 1; fi
+            sleep 1
+          done
+          docker exec safer-mongo mongosh --quiet --eval \
+            'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
+          # Wait for the node to actually become primary; an election is
+          # not instantaneous, and connecting too early fails.
+          for i in $(seq 1 60); do
+            if [ "$(docker exec safer-mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null)" = "true" ]; then
+              break
+            fi
+            if [ "$i" = "60" ]; then echo "no primary elected"; docker logs safer-mongo; exit 1; fi
+            sleep 1
+          done
+          docker exec safer-mongo mongosh --quiet --eval 'rs.status().set + " ok"'
+      # Fail loudly if the integration tests skip. A silently skipped
+      # integration job is worse than no job: it reports green while
+      # testing nothing.
+      - name: Verify MongoDB tests actually run
+        run: |
+          go test -mod=readonly -count=1 -v -timeout=10m ./integration/ ./client/storage/... | tee mongo-test.log
+          if grep -q -- "--- SKIP" mongo-test.log; then
+            echo "MongoDB integration tests skipped; the job is not testing anything"
+            grep -- "--- SKIP" mongo-test.log
+            exit 1
+          fi
+      - name: Test all packages against MongoDB (uncached)
+        run: go test -mod=readonly -count=1 -v -timeout=10m ./...
+      - name: MongoDB logs on failure
+        if: failure()
+        run: docker logs safer-mongo

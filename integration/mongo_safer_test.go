@@ -26,8 +26,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cs161-staff/project2-starter-code/client"
-	"github.com/cs161-staff/project2-starter-code/client/storage/mongostore"
+	"github.com/JamJamzzz/safer-distributed/client"
+	"github.com/JamJamzzz/safer-distributed/client/storage/mongostore"
 )
 
 // requireMongoSAFER points the SAFER client at a private MongoDB database

@@ -22,7 +22,7 @@ import (
 
 	userlib "github.com/cs161-staff/project2-userlib"
 
-	"github.com/cs161-staff/project2-starter-code/client"
+	"github.com/JamJamzzz/safer-distributed/client"
 )
 
 func TestSetupAndExecution(t *testing.T) {

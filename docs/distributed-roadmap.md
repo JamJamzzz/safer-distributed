@@ -44,8 +44,10 @@ The check is not weakened or simulated locally; it is deferred to Linux CI.
 V1 is correct and well tested **within one process**. Its two structural limits:
 
 1. **Process-local locking.** `client/lockmanager` implements strict 2PL with S/X
-   locks, FIFO fairness, and deadlock handling — but entirely in-process, over Go
-   mutexes and condition variables. Two SAFER processes over the same data share no
+   locks, and FIFO fairness — but entirely in-process, over Go mutexes and condition
+   variables. There is no deadlock *detector*: no wait-for-graph, no victim selection.
+   Deadlock is *avoided* by a fixed acquisition order (Namespace before File) that each
+   API operation follows; the lock manager itself has no opinion about ordering. Two SAFER processes over the same data share no
    lock state at all, so nothing prevents them from interleaving destructively. V1
    makes no cross-process correctness claim.
 2. **Non-durable `userlib` storage.** The datastore and keystore are unsynchronized
@@ -65,14 +67,10 @@ V1 is correct and well tested **within one process**. Its two structural limits:
   five wrapper functions (so ~40 call sites are untouched) but delegates through the
   interfaces. `NewUserlibStorage()` remains the default backend.
 
-  Two known gaps, both deliberate:
-  - The wrappers still have V1's error-free signatures. A backend failure is surfaced
-    through `noteStorageFailure` (logged and recorded, never silently dropped) and a
-    failed read reports absence rather than handing unverified bytes to the crypto
-    layer. Plumbing real error returns through the wrappers and their call sites is
-    the first task of Phase 2, done against a backend that can actually fail.
-  - Storage calls carry `context.Background()`. Threading per-operation contexts
-    through the public SAFER API would change that API, which Phase 1 does not.
+  One gap remains from this phase: storage calls carry `context.Background()`.
+  Threading per-operation contexts through the public SAFER API would change that API.
+  (The other Phase 1 gap, wrappers with error-free signatures, was closed in Phase 2:
+  the wrappers now return backend errors and every call site handles them.)
 - **Phase 2 — MongoDB backend.** Done. `client/storage/mongostore` implements the
   Phase 1 interfaces on MongoDB, and `client.UseStorage` installs a backend at
   startup. See "Running SAFER on MongoDB" below.

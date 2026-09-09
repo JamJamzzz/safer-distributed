@@ -21,7 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	client "github.com/cs161-staff/project2-starter-code/client"
+	client "github.com/JamJamzzz/safer-distributed/client"
 	userlib "github.com/cs161-staff/project2-userlib"
 	"github.com/google/uuid"
 )
