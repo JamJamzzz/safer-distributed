@@ -113,11 +113,6 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	}, nil
 }
 
-// Storage returns the bundle SAFER's client layer installs.
-func (s *Store) Storage() storage.Storage {
-	return storage.Storage{Objects: s.objects, Keys: s.keys}
-}
-
 // Objects returns the object half of the backend.
 func (s *Store) Objects() *ObjectStore { return s.objects }
 
@@ -198,8 +193,13 @@ func (s *Store) Close(ctx context.Context) error {
 
 // withTimeout bounds an operation without overriding a deadline the caller
 // already chose.
+//
+// It adds no deadline to a call inside a transaction. The transaction has
+// its own bound, and expiring one statement early would abort the whole
+// transaction rather than just that statement. The session itself is a
+// context value and survives wrapping either way.
 func withTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if _, ok := ctx.Deadline(); ok || timeout <= 0 {
+	if _, ok := ctx.Deadline(); ok || timeout <= 0 || mongo.SessionFromContext(ctx) != nil {
 		return context.WithCancel(ctx)
 	}
 	return context.WithTimeout(ctx, timeout)

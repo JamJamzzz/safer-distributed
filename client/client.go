@@ -196,6 +196,31 @@ func UseUserlibStorage() (restore func()) {
 // and deadlines, and tracing later, without another refactor.
 func operationContext() context.Context { return context.Background() }
 
+// runAtomicStorage runs fn as one all-or-nothing storage mutation.
+//
+// It is the commit point of a SAFER operation. The order around it is
+// deliberate and is what keeps the two layers separate:
+//
+//	acquire logical SAFER locks -> revalidate state -> runAtomicStorage -> end transaction
+//
+// Logical locks are taken first and are held across this call. A MongoDB
+// transaction is never opened and then made to wait for a lock: holding a
+// storage transaction open across a lock wait would let one worker's
+// contention pin database resources for as long as another worker's
+// critical section lasts.
+//
+// fn receives a context derived from ctx and must make all of its storage
+// calls with it. It may be re-run if the backend retries after a transient
+// failure, so every value it writes is computed before this call; fn only
+// writes.
+//
+// With a backend that has no transactions (the in-memory userlib one) this
+// runs fn directly, which is exactly V1's behavior. That is not atomic and
+// is not claimed to be.
+func runAtomicStorage(ctx context.Context, fn func(ctx context.Context) error) error {
+	return storage.RunAtomic(ctx, currentStorage(), fn)
+}
+
 // The wrappers below return backend errors to their callers.
 //
 // The userlib backend cannot fail, so in V1 these returned only a value
@@ -454,28 +479,31 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 		return nil, err
 	}
 
-	//Store the key for dec
-	err = keystoreSet(ctx, 
-		getPKEKeyName(username),
-		pkePulic,
-	)
+	// Commit point: the two public keys and the account record are one
+	// logical identity. A partial commit would be a broken account -- a
+	// claimed username whose keys or account record are missing, and
+	// which cannot be repaired, because key registration is write-once.
+	// All three land together or none does.
+	if err := runAtomicStorage(ctx, func(ctx context.Context) error {
+		//Store the key for dec
+		if err := keystoreSet(ctx,
+			getPKEKeyName(username),
+			pkePulic,
+		); err != nil {
+			return err
+		}
 
-	if err != nil {
-		return nil, err
-	}
+		//Store the key for verify the d.s.
+		if err := keystoreSet(ctx,
+			getVerifyKeyName(username),
+			verifyPublic,
+		); err != nil {
+			return err
+		}
 
-	//Store the key for verify the d.s.
-	err = keystoreSet(ctx, 
-		getVerifyKeyName(username),
-		verifyPublic,
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	//Store the emac account to datastore
-	if err := datastoreSet(ctx, accountUUID, encAccount); err != nil {
+		//Store the emac account to datastore
+		return datastoreSet(ctx, accountUUID, encAccount)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -1447,49 +1475,59 @@ func (userdata *User) storeNewFileLocked(
     	return err
 	}
 
-	if err := datastoreSet(ctx, 
-		baseChunkUUID,
-		protectedChunk,
-	); err != nil {
-		return err
-	}
+	// Commit point: a new file is six objects -- chunk, metadata, access
+	// box, status, access-box structure, namespace entry -- and it is
+	// only a file if all six exist. Written one at a time, a failure part
+	// way through leaves a namespace entry pointing at a missing access
+	// box, or orphaned ciphertext no namespace entry references. Both are
+	// unreachable through SAFER's own API, so nothing would ever clean
+	// them up.
+	//
+	// The namespace entry is written last within the transaction as well.
+	// Order does not affect atomicity, but keeping the entry that makes
+	// the file reachable last preserves the same publish-last shape the
+	// non-transactional path had.
+	return runAtomicStorage(ctx, func(ctx context.Context) error {
+		if err := datastoreSet(ctx,
+			baseChunkUUID,
+			protectedChunk,
+		); err != nil {
+			return err
+		}
 
-	if err := datastoreSet(ctx, 
-		metadataUUID,
-		protectedMetadata,
-	); err != nil {
-		return err
-	}
+		if err := datastoreSet(ctx,
+			metadataUUID,
+			protectedMetadata,
+		); err != nil {
+			return err
+		}
 
-	if err := datastoreSet(ctx, 
-		ownerAccessBoxUUID,
-		protectedAccessBox,
-	); err != nil {
-		return err
-	}
+		if err := datastoreSet(ctx,
+			ownerAccessBoxUUID,
+			protectedAccessBox,
+		); err != nil {
+			return err
+		}
 
-	if err := datastoreSet(ctx, 
-		statusUUID,
-		fileStatusBytes,
-	); err != nil {
-		return err
-	}
+		if err := datastoreSet(ctx,
+			statusUUID,
+			fileStatusBytes,
+		); err != nil {
+			return err
+		}
 
-	if err := datastoreSet(ctx, 
-		structureUUID,
-		protectedAccessBoxStructure,
-	); err != nil {
-		return err
-	}
+		if err := datastoreSet(ctx,
+			structureUUID,
+			protectedAccessBoxStructure,
+		); err != nil {
+			return err
+		}
 
-	if err := datastoreSet(ctx, 
-		nameUUID,
-		protectedNamespaceEntry,
-	); err != nil {
-		return err
-	}
-
-	return nil
+		return datastoreSet(ctx,
+			nameUUID,
+			protectedNamespaceEntry,
+		)
+	})
 }
 
 /** 
@@ -1592,28 +1630,34 @@ func overwriteExistingFileLocked(
         return err
     }
 
-	//Set the new chunk and new metadata
-	if err := datastoreSet(ctx, 
-        newBaseChunkUUID,
-        protectedNewChunk,
-    ); err != nil {
-		return err
-	}
+	// Commit point: an overwrite publishes new content and reclaims the
+	// old chunks. Metadata is the switch -- it names the new chunk chain
+	// and carries the new Version -- so the danger is committing the
+	// metadata without the chunk it points at (an unreadable file), or
+	// deleting old chunks the metadata still references (the same). Both
+	// halves, and the reclamation, are one transaction.
+	return runAtomicStorage(ctx, func(ctx context.Context) error {
+		//Set the new chunk and new metadata
+		if err := datastoreSet(ctx,
+			newBaseChunkUUID,
+			protectedNewChunk,
+		); err != nil {
+			return err
+		}
 
-    if err := datastoreSet(ctx, 
-        accessBox.MetadataUUID,
-        protectedNewMetadata,
-    ); err != nil {
-    	return err
-    }
-	for _, oldChunkUUID := range oldChunkUUIDs {
-        if err := datastoreDelete(ctx, oldChunkUUID); err != nil {
-        	return err
-        }
-    }
-
-    return nil
-
+		if err := datastoreSet(ctx,
+			accessBox.MetadataUUID,
+			protectedNewMetadata,
+		); err != nil {
+			return err
+		}
+		for _, oldChunkUUID := range oldChunkUUIDs {
+			if err := datastoreDelete(ctx, oldChunkUUID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // StoreFile is the strict-2PL transaction boundary for both file creation
@@ -1821,21 +1865,24 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
         return err
     }
 
-	if err := datastoreSet(ctx, 
-        newChunkUUID,
-        protectedNewChunk,
-    ); err != nil {
-		return err
-	}
+	// Commit point: an append is the new chunk plus the metadata that
+	// makes it part of the file. Committing metadata without the chunk
+	// gives a file whose tail cannot be read; committing the chunk
+	// without the metadata silently drops the append while consuming a
+	// Version. Both land together.
+	return runAtomicStorage(ctx, func(ctx context.Context) error {
+		if err := datastoreSet(ctx,
+			newChunkUUID,
+			protectedNewChunk,
+		); err != nil {
+			return err
+		}
 
-    if err := datastoreSet(ctx, 
-        accessBox.MetadataUUID,
-        protectedUpdatedMetadata,
-    ); err != nil {
-    	return err
-    }
-
-    return nil
+		return datastoreSet(ctx,
+			accessBox.MetadataUUID,
+			protectedUpdatedMetadata,
+		)
+	})
 }
 
 /**
@@ -2994,28 +3041,37 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
         return uuid.Nil, err
     }
 
-	if namespaceEntry.IsOwner {
-        if err := datastoreSet(ctx, 
-			grantedBoxUUID,
-			protectedBranchBox,
-		); err != nil {
-        	return uuid.Nil, err
-        }
-
-		if structureChanged {
-			if err := datastoreSet(ctx, 
-				namespaceEntry.AccessBoxStructureUUID,
-				protectedUpdatedStructure,
+	// Commit point: an invitation is only usable if the access box it
+	// names exists and the owner's access-box structure records the new
+	// branch. Committing the invitation alone would hand the recipient a
+	// capability pointing at nothing; committing the branch box without
+	// the structure entry would create a grant that RevokeAccess cannot
+	// later find and therefore cannot revoke -- a permanently
+	// unrevokable share. All of it is one transaction.
+	if err := runAtomicStorage(ctx, func(ctx context.Context) error {
+		if namespaceEntry.IsOwner {
+			if err := datastoreSet(ctx,
+				grantedBoxUUID,
+				protectedBranchBox,
 			); err != nil {
-				return uuid.Nil, err
+				return err
+			}
+
+			if structureChanged {
+				if err := datastoreSet(ctx,
+					namespaceEntry.AccessBoxStructureUUID,
+					protectedUpdatedStructure,
+				); err != nil {
+					return err
+				}
 			}
 		}
-	}
 
-	if err := datastoreSet(ctx, 
-        invitationUUID,
-        invitationBytes,
-    ); err != nil {
+		return datastoreSet(ctx,
+			invitationUUID,
+			invitationBytes,
+		)
+	}); err != nil {
 		return uuid.Nil, err
 	}
 
@@ -3357,18 +3413,21 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
         return err
     }
 
-	if err := datastoreSet(ctx, 
-        nameUUID,
-        protectedNamespaceEntry,
-    ); err != nil {
-		return err
-	}
+	// Commit point: accepting an invitation installs the recipient's
+	// namespace entry and consumes the invitation. Installing the entry
+	// without consuming the invitation would leave a capability that can
+	// be accepted again; consuming it without installing the entry would
+	// destroy the recipient's only route to the file. One transaction.
+	return runAtomicStorage(ctx, func(ctx context.Context) error {
+		if err := datastoreSet(ctx,
+			nameUUID,
+			protectedNamespaceEntry,
+		); err != nil {
+			return err
+		}
 
-    if err := datastoreDelete(ctx, invitationPtr); err != nil {
-    	return err
-    }
-
-    return nil
+		return datastoreDelete(ctx, invitationPtr)
+	})
 }
 
 // RevokeAccess is the strict-2PL transaction boundary for revocation.
@@ -3635,67 +3694,84 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
         return err
     }
 
-	if err := datastoreSet(ctx, 
-        newBaseChunkUUID,
-        protectedNewChunk,
-    ); err != nil {
-		return err
-	}
+	// Commit point: revocation is an epoch rotation, and it is the
+	// largest and most dangerous multi-object mutation SAFER performs. It
+	// re-encrypts the content under a new FileRoot, publishes new
+	// metadata, rewrites the owner's access box and every surviving
+	// branch box, rewrites the access-box structure, advances the file
+	// status to the new epoch, and reclaims the revoked box, the old
+	// metadata, and the old chunks.
+	//
+	// Every partial outcome here is a security or availability failure,
+	// not merely untidy state: surviving readers rewritten but the status
+	// not advanced, or the revoked box deleted while the new epoch never
+	// commits, or old chunks reclaimed while the new metadata is missing.
+	// A revocation that half-applies could leave the file unreadable to
+	// everyone, or leave a revoked user's box in place while the owner
+	// believes access was withdrawn. It commits as one transaction or not
+	// at all.
+	return runAtomicStorage(ctx, func(ctx context.Context) error {
+		if err := datastoreSet(ctx,
+			newBaseChunkUUID,
+			protectedNewChunk,
+		); err != nil {
+			return err
+		}
 
-    if err := datastoreSet(ctx, 
-        newMetadataUUID,
-        protectedNewMetadata,
-    ); err != nil {
-    	return err
-    }
+		if err := datastoreSet(ctx,
+			newMetadataUUID,
+			protectedNewMetadata,
+		); err != nil {
+			return err
+		}
 
-	if err := datastoreSet(ctx, 
-        namespaceEntry.AccessBoxUUID,
-        protectedOwnerAccessBox,
-    ); err != nil {
-		return err
-	}
+		if err := datastoreSet(ctx,
+			namespaceEntry.AccessBoxUUID,
+			protectedOwnerAccessBox,
+		); err != nil {
+			return err
+		}
 
-	for _, write := range survivingWrites {
-        if err := datastoreSet(ctx, 
-            write.BoxUUID,
-            write.Data,
-        ); err != nil {
-        	return err
-        }
-    }
+		for _, write := range survivingWrites {
+			if err := datastoreSet(ctx,
+				write.BoxUUID,
+				write.Data,
+			); err != nil {
+				return err
+			}
+		}
 
-	if err := datastoreSet(ctx, 
-        namespaceEntry.AccessBoxStructureUUID,
-        protectedUpdatedStructure,
-    ); err != nil {
-		return err
-	}
+		if err := datastoreSet(ctx,
+			namespaceEntry.AccessBoxStructureUUID,
+			protectedUpdatedStructure,
+		); err != nil {
+			return err
+		}
 
-    if err := datastoreSet(ctx, 
-        currentAccessBox.StatusUUID,
-        newFileStatusBytes,
-    ); err != nil {
-    	return err
-    }
+		if err := datastoreSet(ctx,
+			currentAccessBox.StatusUUID,
+			newFileStatusBytes,
+		); err != nil {
+			return err
+		}
 
-	if err := datastoreDelete(ctx, 
-        revokedRecord.BoxUUID,
-    ); err != nil {
-		return err
-	}
+		if err := datastoreDelete(ctx,
+			revokedRecord.BoxUUID,
+		); err != nil {
+			return err
+		}
 
-    if err := datastoreDelete(ctx, 
-        currentAccessBox.MetadataUUID,
-    ); err != nil {
-    	return err
-    }
+		if err := datastoreDelete(ctx,
+			currentAccessBox.MetadataUUID,
+		); err != nil {
+			return err
+		}
 
-    for _, oldChunkUUID := range oldChunkUUIDs {
-        if err := datastoreDelete(ctx, oldChunkUUID); err != nil {
-        	return err
-        }
-    }
-
-    return nil
+		for _, oldChunkUUID := range oldChunkUUIDs {
+			if err := datastoreDelete(ctx, oldChunkUUID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
