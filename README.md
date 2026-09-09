@@ -19,8 +19,15 @@ SAFER_MONGO_URI=mongodb://localhost:27017 go test -count=1 ./...
 
 Without `SAFER_MONGO_URI`, MongoDB integration tests skip cleanly and every other test
 still runs. MongoDB provides durable shared persistence only -- it is not the
-concurrency-control mechanism, and SAFER's locking is still process-local, so multiple
-workers sharing one database are not yet safely serialized.
+concurrency-control mechanism.
+
+Lock coordination is likewise pluggable ([client/coordination](client/coordination)):
+the default is V1's process-local `LockManager`, and a gRPC lock coordinator
+([cmd/coordinator](cmd/coordinator)) extends the same strict-2PL semantics across
+separate worker processes. `integration/crossprocess` exercises that with real
+multi-process races. This holds under normal, graceful operation only: there are no
+leases or fencing tokens yet, so a crashed worker leaks its locks and a coordinator
+crash loses lock state.
 
 ## CI and concurrency verification
 

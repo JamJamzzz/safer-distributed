@@ -75,11 +75,16 @@ V1 is correct and well tested **within one process**. Its two structural limits:
   Phase 1 interfaces on MongoDB, and `client.UseStorage` installs a backend at
   startup. See "Running SAFER on MongoDB" below.
 
-- **Phase 3 — Remote coordination.** A single Lock Coordinator wrapping the existing
-  generic `LockManager` core, reached over gRPC by multiple SAFER workers. Small,
-  strict-2PL-oriented surface: `BeginTransaction`, `Acquire`, `RenewLease`,
-  `EndTransaction`, `Health`. Leases and fencing tokens. No consensus, no replication,
-  no lock sharding.
+- **Phase 2.5 — Repository and CI hygiene.** Done. Module path is now
+  `github.com/JamJamzzz/safer-distributed`; CI runs a third job against a MongoDB
+  single-node replica set (a replica set because the next storage phase needs
+  transactions, which a standalone `mongod` cannot serve) and fails if integration
+  tests skip.
+- **Phase 3A — Remote coordination.** Done. See "Cross-process coordination" below.
+- **Phase 3B — Leases and fencing.** Next. `RenewLease`, lease expiry so a crashed
+  worker's locks are reclaimed, and fencing tokens so a revived worker cannot act on a
+  lock it has lost. This is what turns Phase 3A's graceful-operation claim into
+  something that survives failure.
 
 Cryptography, authenticated envelopes, UUID addressing, authorization/capability
 semantics, Namespace/File resources, Version/Epoch behavior, and the public SAFER API
@@ -157,17 +162,100 @@ passed off as valid content — but the stored state can be left incomplete. Wra
 these sequences in MongoDB transactions is the natural next storage-layer step; it
 needs a replica set, since standalone `mongod` does not support them.
 
+## Cross-process coordination (Phase 3A)
+
+Multiple SAFER worker processes now share one lock coordinator, so strict 2PL holds
+across OS processes and not merely across goroutines.
+
+```
+worker process   worker process   worker process
+       \               |               /
+        \              |              /       gRPC
+         +------ lock coordinator ----+
+                       |
+              (the same generic
+               client/lockmanager)
+       ...all sharing one MongoDB for storage
+```
+
+Run it:
+
+```bash
+docker run -d -p 27017:27017 --name safer-mongo mongo:7
+go run ./cmd/coordinator -addr 127.0.0.1:50051
+SAFER_MONGO_URI=mongodb://localhost:27017 SAFER_COORDINATOR_ADDR=127.0.0.1:50051 go test ./integration/crossprocess/
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SAFER_COORDINATOR_ADDR` | *(none)* | Coordinator address. Unset means "no remote coordinator"; there is no guessed default. |
+| `SAFER_COORDINATOR_TIMEOUT` | `10s` | Bounds dialing and `Health`. It deliberately does **not** bound `Acquire`. |
+
+### Design
+
+- **The LockManager is reused, not reimplemented.** S/X compatibility, FIFO fairness,
+  the ResourceID model, and holder/waiter bookkeeping all stay in `client/lockmanager`.
+  The coordinator translates wire types and maps external transaction UUIDs onto the
+  existing internal `uint64` TxnIDs, which are unchanged.
+- **Three RPCs: `Acquire`, `EndTransaction`, `Health`.** No `BeginTransaction`: a worker
+  generates its transaction UUID locally, and the coordinator creates state lazily on
+  first use, so a Begin would only add a round trip and a failure mode. No per-resource
+  `Release`: under strict 2PL locks are released only when the transaction ends.
+- **Cancellation is real.** `LockManager.AcquireContext` removes a cancelled request
+  from the wait queue, so a worker that disconnects cannot be granted a ghost lock
+  later. Cancellation is checked before grantability, and a request still queued when
+  its transaction ends is released immediately if it is granted afterwards.
+- **`Acquire` has no client-side deadline.** Waiting is the correct outcome of
+  contention under strict 2PL; a timeout would turn ordinary contention into failure.
+- **Benchmark strategies stay local.** `StrategyGlobalLock` and `StrategyNoCC` measure
+  this process's alternatives to fine-grained 2PL, so they do not route through the
+  coordination backend.
+
+### Evidence
+
+`integration/crossprocess` starts one coordinator process and two or more independent
+worker processes -- each with its own MongoDB connection, its own gRPC connection, and
+its own SAFER client state -- against one database. Workers rendezvous at an explicit
+barrier and are released together, so operations genuinely overlap; no test uses a
+sleep to create a race. Covered: concurrent append vs append, append vs overwrite,
+load vs overwrite, five simultaneous appenders, and a control asserting the writers
+were actually serialized.
+
+The suite was validated by negative control: with the workers' coordinator wiring
+removed so each falls back to its own process-local LockManager, the same tests fail
+with real lost updates (`base-AAA` missing the second append; four of five fragments
+lost). The tests detect the failure they claim to.
+
+### What this does not cover
+
+- A worker that dies without calling `EndTransaction` **leaks its locks** until the
+  coordinator restarts. There are no leases yet.
+- A coordinator crash **loses all lock state**, and workers holding locks are not told.
+  It is a single process with in-memory state, not replicated.
+- There are no fencing tokens, so nothing stops a stalled worker from acting after its
+  lock should have been considered lost.
+- Multi-object MongoDB writes are still not atomic (see the storage limitation above).
+- The gRPC channel is not encrypted or authenticated. SAFER's objects are encrypted and
+  authenticated before reaching storage, so this channel carries no plaintext content
+  and no key material -- only resource identifiers and lock modes -- but an attacker on
+  it could forge lock traffic. It is meant for a trusted network.
+
 ## Claims not yet earned
 
 Recorded here so they are not asserted prematurely:
 
-- **No distributed correctness claim** — locking is still process-local, and there are
-  no cross-process tests. A shared database does not make concurrent workers safe.
+- **Cross-process coordination, under graceful operation only.** Earned: strict 2PL
+  across separate OS processes sharing one coordinator and one database, verified by
+  multi-process tests and a negative control. Not earned: any behavior under crashes,
+  partitions, or coordinator failure.
 - **Durability, narrowly.** Verified: data written through one SAFER client and
   connection pool is readable through a separate one afterwards, which is what a worker
   restart looks like from storage's point of view. Not verified: crash consistency, or
   behavior under a mid-operation failure — see the atomicity limitation above.
-- **No fault-tolerance claim** — the only failure tests are an injected failing backend
-  and an unreachable one. There is no kill-the-database or partition testing.
+- **No fault-tolerance claim** — failure testing covers an injected failing storage
+  backend, an unreachable one, an unreachable coordinator at startup, and cancelled or
+  abandoned lock requests. There is no kill-the-database, kill-the-coordinator,
+  kill-the-worker, or partition testing, and no lease or fencing machinery to make such
+  tests meaningful yet. That is Phase 3B.
 - The checked-in benchmark tables are inherited historical SAFER-CC measurements, not
   performance claims about this repository.

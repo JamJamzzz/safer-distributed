@@ -105,14 +105,14 @@ jobs:
       # testing nothing.
       - name: Verify MongoDB tests actually run
         run: |
-          go test -mod=readonly -count=1 -v -timeout=10m ./integration/ ./client/storage/... | tee mongo-test.log
+          go test -mod=readonly -count=1 -v -timeout=15m ./integration/... ./client/storage/... | tee mongo-test.log
           if grep -q -- "--- SKIP" mongo-test.log; then
             echo "MongoDB integration tests skipped; the job is not testing anything"
             grep -- "--- SKIP" mongo-test.log
             exit 1
           fi
       - name: Test all packages against MongoDB (uncached)
-        run: go test -mod=readonly -count=1 -v -timeout=10m ./...
+        run: go test -mod=readonly -count=1 -v -timeout=15m ./...
       - name: MongoDB logs on failure
         if: failure()
         run: docker logs safer-mongo
