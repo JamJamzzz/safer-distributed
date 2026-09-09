@@ -29,10 +29,12 @@ import (
 // would serialize a backend whose entire purpose is concurrent shared
 // access, and would not coordinate anything across processes anyway.
 type Store struct {
-	client  *mongo.Client
-	timeout time.Duration
-	objects *ObjectStore
-	keys    *KeyStore
+	client             *mongo.Client
+	database           string
+	timeout            time.Duration
+	transactionTimeout time.Duration
+	objects            *ObjectStore
+	keys               *KeyStore
 }
 
 // ObjectStore persists SAFER's encrypted objects in the objects
@@ -106,10 +108,12 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 
 	db := client.Database(cfg.Database)
 	return &Store{
-		client:  client,
-		timeout: cfg.Timeout,
-		objects: &ObjectStore{collection: db.Collection(ObjectsCollection), timeout: cfg.Timeout},
-		keys:    &KeyStore{collection: db.Collection(KeysCollection), timeout: cfg.Timeout},
+		client:             client,
+		database:           cfg.Database,
+		timeout:            cfg.Timeout,
+		transactionTimeout: cfg.TransactionTimeout,
+		objects:            &ObjectStore{collection: db.Collection(ObjectsCollection), timeout: cfg.Timeout},
+		keys:               &KeyStore{collection: db.Collection(KeysCollection), timeout: cfg.Timeout},
 	}, nil
 }
 

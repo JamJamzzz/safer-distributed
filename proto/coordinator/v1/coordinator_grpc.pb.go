@@ -21,9 +21,14 @@
 // release is EndTransaction, which releases all of them at once. Offering
 // early release would hand callers a way to violate the protocol.
 //
-// There is no lease or fencing-token machinery yet. That is the next
-// phase, and its absence is the reason a crashed worker can still leak
-// locks here.
+// Transactions carry a lease. The coordinator is authoritative for the
+// deadline; a worker renews it while it works. A passed deadline does not
+// release anything by itself -- it only makes the transaction eligible for
+// revocation, which is a deliberate, ordered process on the coordinator.
+//
+// Exclusive grants carry a fencing token. Shared grants do not: a stale
+// reader cannot corrupt anything, and issuing tokens for readers would
+// serialize them against each other for no benefit.
 
 package coordinatorv1
 
@@ -42,6 +47,7 @@ const _ = grpc.SupportPackageIsVersion7
 const (
 	LockCoordinator_Acquire_FullMethodName        = "/coordinator.v1.LockCoordinator/Acquire"
 	LockCoordinator_EndTransaction_FullMethodName = "/coordinator.v1.LockCoordinator/EndTransaction"
+	LockCoordinator_RenewLease_FullMethodName     = "/coordinator.v1.LockCoordinator/RenewLease"
 	LockCoordinator_Health_FullMethodName         = "/coordinator.v1.LockCoordinator/Health"
 )
 
@@ -57,6 +63,12 @@ type LockCoordinatorClient interface {
 	// idempotent, and workers call it on every path, including after an
 	// Acquire whose response never arrived.
 	EndTransaction(ctx context.Context, in *EndTransactionRequest, opts ...grpc.CallOption) (*EndTransactionResponse, error)
+	// RenewLease extends a transaction's lease.
+	//
+	// It is idempotent: renewing repeatedly simply moves the deadline. It
+	// fails once the transaction is being revoked or is gone, which is how
+	// a worker learns it has lost its locks.
+	RenewLease(ctx context.Context, in *RenewLeaseRequest, opts ...grpc.CallOption) (*RenewLeaseResponse, error)
 	// Health reports that the coordinator is serving.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
 }
@@ -87,6 +99,15 @@ func (c *lockCoordinatorClient) EndTransaction(ctx context.Context, in *EndTrans
 	return out, nil
 }
 
+func (c *lockCoordinatorClient) RenewLease(ctx context.Context, in *RenewLeaseRequest, opts ...grpc.CallOption) (*RenewLeaseResponse, error) {
+	out := new(RenewLeaseResponse)
+	err := c.cc.Invoke(ctx, LockCoordinator_RenewLease_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *lockCoordinatorClient) Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error) {
 	out := new(HealthResponse)
 	err := c.cc.Invoke(ctx, LockCoordinator_Health_FullMethodName, in, out, opts...)
@@ -108,6 +129,12 @@ type LockCoordinatorServer interface {
 	// idempotent, and workers call it on every path, including after an
 	// Acquire whose response never arrived.
 	EndTransaction(context.Context, *EndTransactionRequest) (*EndTransactionResponse, error)
+	// RenewLease extends a transaction's lease.
+	//
+	// It is idempotent: renewing repeatedly simply moves the deadline. It
+	// fails once the transaction is being revoked or is gone, which is how
+	// a worker learns it has lost its locks.
+	RenewLease(context.Context, *RenewLeaseRequest) (*RenewLeaseResponse, error)
 	// Health reports that the coordinator is serving.
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
 	mustEmbedUnimplementedLockCoordinatorServer()
@@ -122,6 +149,9 @@ func (UnimplementedLockCoordinatorServer) Acquire(context.Context, *AcquireReque
 }
 func (UnimplementedLockCoordinatorServer) EndTransaction(context.Context, *EndTransactionRequest) (*EndTransactionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method EndTransaction not implemented")
+}
+func (UnimplementedLockCoordinatorServer) RenewLease(context.Context, *RenewLeaseRequest) (*RenewLeaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RenewLease not implemented")
 }
 func (UnimplementedLockCoordinatorServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Health not implemented")
@@ -175,6 +205,24 @@ func _LockCoordinator_EndTransaction_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LockCoordinator_RenewLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewLeaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LockCoordinatorServer).RenewLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LockCoordinator_RenewLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LockCoordinatorServer).RenewLease(ctx, req.(*RenewLeaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LockCoordinator_Health_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(HealthRequest)
 	if err := dec(in); err != nil {
@@ -207,6 +255,10 @@ var LockCoordinator_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "EndTransaction",
 			Handler:    _LockCoordinator_EndTransaction_Handler,
+		},
+		{
+			MethodName: "RenewLease",
+			Handler:    _LockCoordinator_RenewLease_Handler,
 		},
 		{
 			MethodName: "Health",

@@ -17,9 +17,14 @@ syntax = "proto3";
 // release is EndTransaction, which releases all of them at once. Offering
 // early release would hand callers a way to violate the protocol.
 //
-// There is no lease or fencing-token machinery yet. That is the next
-// phase, and its absence is the reason a crashed worker can still leak
-// locks here.
+// Transactions carry a lease. The coordinator is authoritative for the
+// deadline; a worker renews it while it works. A passed deadline does not
+// release anything by itself -- it only makes the transaction eligible for
+// revocation, which is a deliberate, ordered process on the coordinator.
+//
+// Exclusive grants carry a fencing token. Shared grants do not: a stale
+// reader cannot corrupt anything, and issuing tokens for readers would
+// serialize them against each other for no benefit.
 package coordinator.v1;
 
 option go_package = "github.com/JamJamzzz/safer-distributed/proto/coordinator/v1;coordinatorv1";
@@ -58,7 +63,30 @@ message AcquireRequest {
   LockMode mode = 3;
 }
 
-message AcquireResponse {}
+message AcquireResponse {
+  // fencing_token is set only for exclusive grants, and is zero for
+  // shared ones. It is allocated durably before this response is sent, so
+  // a worker never receives an unfenced exclusive grant.
+  //
+  // Retrying an identical Acquire returns the SAME token rather than
+  // allocating a new one, so a retry after a lost response recovers the
+  // original outcome instead of inventing a second grant.
+  uint64 fencing_token = 1;
+
+  // lease_expires_unix_nano is the coordinator's authoritative deadline
+  // for this transaction. It is advisory to the worker -- the coordinator
+  // decides when a lease has passed -- but it tells the worker how often
+  // it must renew.
+  int64 lease_expires_unix_nano = 2;
+}
+
+message RenewLeaseRequest {
+  string transaction_id = 1;
+}
+
+message RenewLeaseResponse {
+  int64 lease_expires_unix_nano = 1;
+}
 
 message EndTransactionRequest {
   string transaction_id = 1;
@@ -79,6 +107,10 @@ message HealthResponse {
   // protocol guarantee. They are a point-in-time sample.
   uint32 active_transactions = 1;
   uint32 held_locks = 2;
+  // revoking_transactions counts transactions whose lease has passed and
+  // whose cleanup is in progress. A number that stays above zero means
+  // fence invalidation is failing and locks are being held on purpose.
+  uint32 revoking_transactions = 3;
 }
 
 // LockCoordinator serves strict-2PL lock decisions for multiple SAFER
@@ -93,6 +125,13 @@ service LockCoordinator {
   // idempotent, and workers call it on every path, including after an
   // Acquire whose response never arrived.
   rpc EndTransaction(EndTransactionRequest) returns (EndTransactionResponse);
+
+  // RenewLease extends a transaction's lease.
+  //
+  // It is idempotent: renewing repeatedly simply moves the deadline. It
+  // fails once the transaction is being revoked or is gone, which is how
+  // a worker learns it has lost its locks.
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
 
   // Health reports that the coordinator is serving.
   rpc Health(HealthRequest) returns (HealthResponse);

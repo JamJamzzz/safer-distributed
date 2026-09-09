@@ -34,12 +34,21 @@ const (
 	EnvURI      = "SAFER_MONGO_URI"
 	EnvDatabase = "SAFER_MONGO_DB"
 	EnvTimeout  = "SAFER_MONGO_TIMEOUT"
+	// EnvTransactionTimeout bounds a whole storage transaction when the
+	// caller has no deadline of its own.
+	EnvTransactionTimeout = "SAFER_MONGO_TXN_TIMEOUT"
 )
 
 // Defaults applied when the corresponding variable is unset.
 const (
 	DefaultDatabase = "safer"
 	DefaultTimeout  = 10 * time.Second
+	// DefaultTransactionTimeout bounds one whole storage transaction. It
+	// is generous compared with a single operation, because a legitimate
+	// multi-object mutation is still one round of writes, and stingy
+	// compared with forever, because an unbounded transaction can pin a
+	// lock's lease alive indefinitely.
+	DefaultTransactionTimeout = 30 * time.Second
 )
 
 // Collection names. The schema is intentionally minimal: two collections,
@@ -57,7 +66,16 @@ type Config struct {
 	Database string
 	// Timeout bounds connection and per-operation work when the caller's
 	// context carries no deadline of its own. Defaults to DefaultTimeout.
+	//
+	// It is deliberately NOT applied to statements inside a transaction:
+	// expiring one statement aborts the whole transaction rather than
+	// just that statement.
 	Timeout time.Duration
+
+	// TransactionTimeout bounds one whole RunAtomic call when the caller
+	// supplied no deadline, so a wedged operation cannot hold a
+	// transaction open forever. Defaults to DefaultTransactionTimeout.
+	TransactionTimeout time.Duration
 }
 
 // ConfigFromEnv builds a Config from the environment.
@@ -89,6 +107,17 @@ func ConfigFromEnv() (cfg Config, configured bool, err error) {
 		}
 		cfg.Timeout = d
 	}
+
+	if raw := os.Getenv(EnvTransactionTimeout); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, false, fmt.Errorf("%s=%q: not a duration: %w", EnvTransactionTimeout, raw, err)
+		}
+		if d <= 0 {
+			return Config{}, false, fmt.Errorf("%s=%q: must be positive", EnvTransactionTimeout, raw)
+		}
+		cfg.TransactionTimeout = d
+	}
 	return cfg.withDefaults(), true, nil
 }
 
@@ -99,6 +128,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = DefaultTimeout
+	}
+	if c.TransactionTimeout <= 0 {
+		c.TransactionTimeout = DefaultTransactionTimeout
 	}
 	return c
 }
