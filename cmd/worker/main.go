@@ -109,7 +109,9 @@ func run(cfg Config) error {
 	// what makes claims about cross-replica load balancing (see dial.go
 	// and cmd/loadgen) checkable instead of asserted.
 	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(instanceHeaderInterceptor(instanceID())))
-	workerv1.RegisterSaferWorkerServer(grpcServer, &saferWorkerServer{})
+	workerv1.RegisterSaferWorkerServer(grpcServer, &saferWorkerServer{
+		authLimiter: newAuthLimiter(cfg.AuthConcurrency),
+	})
 
 	healthServer := health.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthServer)

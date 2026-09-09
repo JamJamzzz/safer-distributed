@@ -32,8 +32,16 @@ import (
 // client.InitUserContext and friends, and their package doc for why the
 // legacy context-free methods -- still used by V1 callers -- could not
 // simply be changed in place).
+//
+// authLimiter bounds how many of this process's calls are inside
+// InitUserContext's key generation or GetUserContext's Argon2 key
+// derivation at once -- see authlimit.go for why: each such call is
+// genuinely memory-heavy, and an unbounded number of them running at
+// once in one process has no ceiling a static memory limit can be sized
+// against.
 type saferWorkerServer struct {
 	workerv1.UnimplementedSaferWorkerServer
+	authLimiter *authLimiter
 }
 
 func (s *saferWorkerServer) InitUser(ctx context.Context, req *workerv1.InitUserRequest) (*workerv1.InitUserResponse, error) {
@@ -43,6 +51,10 @@ func (s *saferWorkerServer) InitUser(ctx context.Context, req *workerv1.InitUser
 	if req.GetPassword() == "" {
 		return nil, status.Error(codes.InvalidArgument, "worker: password is required")
 	}
+	if err := s.authLimiter.acquire(ctx); err != nil {
+		return nil, translateErr(ctx, "InitUser", err)
+	}
+	defer s.authLimiter.release()
 	if _, err := client.InitUserContext(ctx, req.GetUsername(), req.GetPassword()); err != nil {
 		return nil, translateErr(ctx, "InitUser", err)
 	}
@@ -50,7 +62,7 @@ func (s *saferWorkerServer) InitUser(ctx context.Context, req *workerv1.InitUser
 }
 
 func (s *saferWorkerServer) StoreFile(ctx context.Context, req *workerv1.StoreFileRequest) (*workerv1.StoreFileResponse, error) {
-	user, err := authenticate(ctx, req.GetUsername(), req.GetPassword())
+	user, err := authenticate(ctx, s.authLimiter, req.GetUsername(), req.GetPassword())
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +76,7 @@ func (s *saferWorkerServer) StoreFile(ctx context.Context, req *workerv1.StoreFi
 }
 
 func (s *saferWorkerServer) AppendToFile(ctx context.Context, req *workerv1.AppendToFileRequest) (*workerv1.AppendToFileResponse, error) {
-	user, err := authenticate(ctx, req.GetUsername(), req.GetPassword())
+	user, err := authenticate(ctx, s.authLimiter, req.GetUsername(), req.GetPassword())
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +90,7 @@ func (s *saferWorkerServer) AppendToFile(ctx context.Context, req *workerv1.Appe
 }
 
 func (s *saferWorkerServer) LoadFile(ctx context.Context, req *workerv1.LoadFileRequest) (*workerv1.LoadFileResponse, error) {
-	user, err := authenticate(ctx, req.GetUsername(), req.GetPassword())
+	user, err := authenticate(ctx, s.authLimiter, req.GetUsername(), req.GetPassword())
 	if err != nil {
 		return nil, err
 	}
@@ -94,13 +106,22 @@ func (s *saferWorkerServer) LoadFile(ctx context.Context, req *workerv1.LoadFile
 
 // authenticate validates the request's credentials fields and derives the
 // caller's SAFER user, exactly as every SAFER operation already requires.
-func authenticate(ctx context.Context, username, password string) (*client.User, error) {
+//
+// The GetUserContext call itself -- Argon2 key derivation -- is gated by
+// limiter, not the validation around it: an empty username/password is
+// cheap to reject and should not wait for an admission slot meant for
+// expensive work.
+func authenticate(ctx context.Context, limiter *authLimiter, username, password string) (*client.User, error) {
 	if username == "" {
 		return nil, status.Error(codes.InvalidArgument, "worker: username is required")
 	}
 	if password == "" {
 		return nil, status.Error(codes.InvalidArgument, "worker: password is required")
 	}
+	if err := limiter.acquire(ctx); err != nil {
+		return nil, translateErr(ctx, "GetUser", err)
+	}
+	defer limiter.release()
 	user, err := client.GetUserContext(ctx, username, password)
 	if err != nil {
 		return nil, translateErr(ctx, "GetUser", err)

@@ -86,7 +86,9 @@ func startTestWorker(t *testing.T) workerv1.SaferWorkerClient {
 		t.Fatalf("listen: %v", err)
 	}
 	grpcServer := grpc.NewServer()
-	workerv1.RegisterSaferWorkerServer(grpcServer, &saferWorkerServer{})
+	workerv1.RegisterSaferWorkerServer(grpcServer, &saferWorkerServer{
+		authLimiter: newAuthLimiter(DefaultAuthConcurrency),
+	})
 
 	served := make(chan struct{})
 	go func() {

@@ -76,6 +76,8 @@ func TestParseConfig_RefusesNonPositiveTimeouts(t *testing.T) {
 		{"-shutdown-timeout", "-1s"},
 		{"-readiness-interval", "0s"},
 		{"-readiness-interval", "-1s"},
+		{"-auth-concurrency", "0"},
+		{"-auth-concurrency", "-1"},
 	} {
 		if _, err := parseConfig(args); err == nil {
 			t.Errorf("parseConfig(%v): expected an error, got nil", args)
@@ -100,5 +102,8 @@ func TestParseConfig_DefaultsApplied(t *testing.T) {
 	}
 	if cfg.ReadinessInterval != DefaultReadinessInterval {
 		t.Errorf("ReadinessInterval = %v, want default %v", cfg.ReadinessInterval, DefaultReadinessInterval)
+	}
+	if cfg.AuthConcurrency != DefaultAuthConcurrency {
+		t.Errorf("AuthConcurrency = %v, want default %v", cfg.AuthConcurrency, DefaultAuthConcurrency)
 	}
 }

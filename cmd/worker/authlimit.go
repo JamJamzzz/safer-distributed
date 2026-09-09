@@ -1,0 +1,82 @@
+package main
+
+// Bounded admission control for SAFER's expensive authentication/key-
+// derivation path.
+//
+// Live measurement (kind, Phase 4.6; see docs/distributed-roadmap.md's
+// Phase 4.6 section for the full write-up) found that every
+// StoreFile/AppendToFile/LoadFile RPC re-authenticates its caller through
+// client.GetUserContext -> deriveAccountKey -> userlib.Argon2Key, and
+// InitUser performs its own expensive key generation (RSA/DS keygen).
+// userlib's Argon2Key calls golang.org/x/crypto/argon2.IDKey with a
+// memory parameter of 64*1024 KiB (64 MiB) per call -- a deliberate,
+// fixed cost of the memory-hard KDF, not a bug and not something this
+// package weakens. A single worker process observed under real
+// concurrent load settled at roughly 150-165 MB of resident memory after
+// any burst of this work (Go's allocator does not hand pages back to the
+// OS quickly, so that level persists between bursts rather than an
+// isolated spike), and two or more of these sections genuinely
+// overlapping in one process pushed it well past a 256Mi container
+// limit, reproducibly, without approaching that limit ever climbing
+// further across repeated runs -- i.e. concurrency pressure, not a leak.
+//
+// The fix is not "give the container more memory and hope": an
+// unbounded number of concurrent authentications in one process has no
+// ceiling at all, so no static memory limit is actually safe against it.
+// authLimiter puts an explicit, small, context-aware ceiling on how many
+// of these sections may run at once in this process, so memory sizing
+// (see deploy/kubernetes/worker-deployment.yaml) can be reasoned about
+// instead of guessed.
+//
+// This is scoped to exactly the expensive section, not the whole RPC:
+// once a request has authenticated, the rest of its work (lock
+// acquisition, the MongoDB transaction) is not memory-hard the same way
+// and is not gated here.
+
+import "context"
+
+// authLimiter bounds how many expensive authentication/key-derivation
+// sections run concurrently in this worker process.
+//
+// It adds no server-side session state: every acquire/release pair
+// brackets exactly one call to client.GetUserContext or
+// client.InitUserContext, the same per-call re-authentication SAFER
+// already does. Nothing about a password or a derived account key is
+// cached or reused across requests, and no crypto parameter here is
+// weakened -- this only delays when a request is allowed to start that
+// work, never what the work computes.
+type authLimiter struct {
+	sem chan struct{}
+}
+
+// newAuthLimiter builds a limiter admitting at most n concurrent sections.
+// n <= 0 is treated as 1: a limiter that admits zero would deadlock every
+// request, which is never the intent of a misconfigured value here.
+func newAuthLimiter(n int) *authLimiter {
+	if n <= 0 {
+		n = 1
+	}
+	return &authLimiter{sem: make(chan struct{}, n)}
+}
+
+// acquire blocks until a slot is free or ctx is done, whichever comes
+// first. On success the caller MUST call release exactly once -- normally
+// via `defer` immediately after a successful acquire -- or the slot is
+// never given back. On failure (ctx.Err()) no slot was taken and there is
+// nothing to release.
+func (a *authLimiter) acquire(ctx context.Context) error {
+	select {
+	case a.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// release gives back a slot acquired by acquire. Calling it without a
+// matching successful acquire blocks forever if the semaphore is already
+// at capacity (an empty channel has nothing to receive) -- which is a
+// bug in the caller, not a state authLimiter tries to tolerate.
+func (a *authLimiter) release() {
+	<-a.sem
+}

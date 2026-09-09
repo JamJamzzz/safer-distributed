@@ -10,10 +10,24 @@ import (
 )
 
 // Defaults for the flags below.
+//
+// DefaultAuthConcurrency is evidence-derived, not a guess (Phase 4.6; see
+// docs/distributed-roadmap.md's Phase 4.6 section for the full
+// measurement). A live worker process, under real load, settled at
+// roughly 150-165 MB of resident memory after any burst of concurrent
+// GetUserContext/InitUserContext calls (each performs an Argon2 key
+// derivation or RSA/DS key generation), and two such calls genuinely
+// overlapping pushed a single process to as much as ~217 MB observed,
+// with four overlapping reliably exceeding 256 MB and triggering an
+// OOM kill. 2 admits real concurrency while keeping one worker's expected
+// peak (roughly 2 x 160-220 MB) inside deploy/kubernetes/worker-
+// deployment.yaml's memory limit, which was raised to match (see that
+// file's own comment).
 const (
 	DefaultListenAddr        = ":50052"
 	DefaultShutdownTimeout   = 25 * time.Second
 	DefaultReadinessInterval = 5 * time.Second
+	DefaultAuthConcurrency   = 2
 )
 
 // Config is everything one worker process needs to start.
@@ -29,8 +43,14 @@ type Config struct {
 	ListenAddr        string
 	ShutdownTimeout   time.Duration
 	ReadinessInterval time.Duration
-	Mongo             mongostore.Config
-	Coordinator       grpccoord.Config
+	// AuthConcurrency bounds how many of this process's
+	// GetUserContext/InitUserContext calls (Argon2 key derivation, or
+	// RSA/DS key generation) may run at once -- see authlimit.go and
+	// DefaultAuthConcurrency's doc for why this exists and how the
+	// default was chosen.
+	AuthConcurrency int
+	Mongo           mongostore.Config
+	Coordinator     grpccoord.Config
 }
 
 // parseConfig builds a Config from command-line flags and the environment.
@@ -46,6 +66,9 @@ func parseConfig(args []string) (Config, error) {
 		"how long to wait for in-flight RPCs to finish during a graceful shutdown before forcing the stop")
 	readinessInterval := fs.Duration("readiness-interval", DefaultReadinessInterval,
 		"how often to re-check MongoDB and coordinator reachability for the readiness probe")
+	authConcurrency := fs.Int("auth-concurrency", DefaultAuthConcurrency,
+		"max concurrent GetUserContext/InitUserContext calls (Argon2 key derivation, RSA/DS key "+
+			"generation) this process runs at once; bounds memory, see DefaultAuthConcurrency's doc")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -54,6 +77,9 @@ func parseConfig(args []string) (Config, error) {
 	}
 	if *readinessInterval <= 0 {
 		return Config{}, fmt.Errorf("worker: -readiness-interval must be positive")
+	}
+	if *authConcurrency <= 0 {
+		return Config{}, fmt.Errorf("worker: -auth-concurrency must be positive")
 	}
 
 	mongoCfg, configured, err := mongostore.ConfigFromEnv()
@@ -77,6 +103,7 @@ func parseConfig(args []string) (Config, error) {
 		ListenAddr:        *addr,
 		ShutdownTimeout:   *shutdownTimeout,
 		ReadinessInterval: *readinessInterval,
+		AuthConcurrency:   *authConcurrency,
 		Mongo:             mongoCfg,
 		Coordinator:       coordCfg,
 	}, nil
