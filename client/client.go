@@ -27,6 +27,7 @@ import (
 	userlib "github.com/cs161-staff/project2-userlib"
 	"github.com/google/uuid"
 
+	"github.com/JamJamzzz/safer-distributed/client/coordination"
 	"github.com/JamJamzzz/safer-distributed/client/lockmanager"
 	"github.com/JamJamzzz/safer-distributed/client/storage"
 
@@ -865,11 +866,51 @@ func SetConcurrencyStrategyForBenchmark(strategy ConcurrencyStrategy) {
 
 var globalBenchmarkMutex sync.Mutex
 
-// lockGuardLike is satisfied by *lockmanager.LockGuard (used unchanged
-// for StrategySaferCC) and by the two benchmark-only stand-ins below.
-type lockGuardLike interface {
-	Acquire(resource lockmanager.ResourceID, mode lockmanager.LockMode) error
-	ReleaseAll()
+// lockGuardLike is satisfied by the guards the active coordination
+// backend hands out (for StrategySaferCC) and by the two benchmark-only
+// stand-ins below. It is coordination.Guard; the alias is kept so the
+// existing operation bodies and their comments still read the same.
+type lockGuardLike = coordination.Guard
+
+// activeCoordination is the coordination backend StrategySaferCC routes
+// through: the process-local LockManager by default, or a remote
+// coordinator when one is installed.
+//
+// It is an atomic pointer for the same reason the storage handle is: a
+// deployment installs its backend at startup while operations may already
+// be running.
+var activeCoordination atomic.Pointer[coordination.Backend]
+
+func init() {
+	UseLocalCoordination()
+}
+
+// currentCoordination returns the installed coordination backend.
+func currentCoordination() coordination.Backend { return *activeCoordination.Load() }
+
+// UseCoordination installs the coordination backend SAFER operations use,
+// and returns a function that restores the previous one.
+//
+// Like UseStorage, it is meant to be called once at startup, before any
+// SAFER operation runs. Switching backends underneath a live transaction
+// would leave it holding locks in one manager and ending them in another.
+//
+// Installing a remote backend changes where lock decisions are made, not
+// what they are: the same LockManager logic runs, inside the coordinator.
+// Cryptography, authorization, and storage are unaffected.
+func UseCoordination(b coordination.Backend) (restore func()) {
+	if b == nil {
+		panic("client: UseCoordination requires a backend")
+	}
+	previous := activeCoordination.Swap(&b)
+	return func() { activeCoordination.Store(previous) }
+}
+
+// UseLocalCoordination installs the process-local LockManager backend,
+// which is the default. It coordinates goroutines within this process
+// only; two processes using it share nothing.
+func UseLocalCoordination() (restore func()) {
+	return UseCoordination(coordination.NewLocalBackend(saferLockManager))
 }
 
 // globalMutexGuard serializes an entire operation behind one process-wide
@@ -907,14 +948,17 @@ func (noCCGuard) ReleaseAll()                                                   
 // newOperationGuard is the one call site every public operation uses to
 // obtain its lock guard. Swapping strategies never touches anything else
 // in an operation's body.
-func newOperationGuard(txn lockmanager.TxnID) lockGuardLike {
+func newOperationGuard(txn lockmanager.TxnID) (lockGuardLike, error) {
 	switch ConcurrencyStrategy(activeConcurrencyStrategy.Load()) {
 	case StrategyGlobalLock:
-		return &globalMutexGuard{}
+		// Benchmark baselines are deliberately unaffected by the
+		// coordination backend: they exist to measure this process's
+		// alternatives to fine-grained 2PL, not to be distributed.
+		return &globalMutexGuard{}, nil
 	case StrategyNoCC:
-		return &noCCGuard{}
+		return &noCCGuard{}, nil
 	default:
-		return lockmanager.NewLockGuard(saferLockManager, txn)
+		return currentCoordination().Begin(txn)
 	}
 }
 
@@ -1579,7 +1623,10 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		return err
 	}
 
-	guard := newOperationGuard(txn)
+	guard, err := newOperationGuard(txn)
+	if err != nil {
+		return err
+	}
 	defer guard.ReleaseAll()
 
 	nsResource, err := namespaceResourceID(userdata.Username, filename)
@@ -1651,7 +1698,10 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 		return err
 	}
 
-	guard := newOperationGuard(txn)
+	guard, err := newOperationGuard(txn)
+	if err != nil {
+		return err
+	}
 	defer guard.ReleaseAll()
 
 	nsResource, err := namespaceResourceID(userdata.Username, filename)
@@ -2420,7 +2470,10 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 		return nil, err
 	}
 
-	guard := newOperationGuard(txn)
+	guard, err := newOperationGuard(txn)
+	if err != nil {
+		return nil, err
+	}
 	defer guard.ReleaseAll()
 
 	nsResource, err := namespaceResourceID(userdata.Username, filename)
@@ -2763,7 +2816,10 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 		return uuid.Nil, err
 	}
 
-	guard := newOperationGuard(txn)
+	guard, err := newOperationGuard(txn)
+	if err != nil {
+		return uuid.Nil, err
+	}
 	defer guard.ReleaseAll()
 
 	nsResource, err := namespaceResourceID(userdata.Username, filename)
@@ -3179,7 +3235,10 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 		return err
 	}
 
-	guard := newOperationGuard(txn)
+	guard, err := newOperationGuard(txn)
+	if err != nil {
+		return err
+	}
 	defer guard.ReleaseAll()
 
 	nsResource, err := namespaceResourceID(userdata.Username, filename)
@@ -3305,7 +3364,10 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
 		return err
 	}
 
-	guard := newOperationGuard(txn)
+	guard, err := newOperationGuard(txn)
+	if err != nil {
+		return err
+	}
 	defer guard.ReleaseAll()
 
 	nsResource, err := namespaceResourceID(userdata.Username, filename)
