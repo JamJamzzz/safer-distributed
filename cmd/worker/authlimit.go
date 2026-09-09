@@ -36,7 +36,38 @@ package main
 // acquisition, the MongoDB transaction) is not memory-hard the same way
 // and is not gated here.
 
-import "context"
+import (
+	"context"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+// meter, authAdmissionWait, and authInFlight are unconditional and safe
+// with no telemetry backend configured (see internal/telemetry's package
+// doc): with no real MeterProvider installed, otel.Meter returns a no-op
+// implementation.
+var (
+	authMeter = otel.Meter("github.com/JamJamzzz/safer-distributed/cmd/worker")
+
+	// authAdmissionWait and authInFlight together answer "is the auth
+	// admission limiter causing latency?" (Phase 5's metrics requirement
+	// B). authAdmissionWait is how long a request actually waited for a
+	// slot (zero whenever one was immediately free); authInFlight is a
+	// live saturation signal -- if it sits at authLimiter's configured
+	// capacity, requests are queueing on it right now.
+	authAdmissionWait, _ = authMeter.Float64Histogram(
+		"safer.worker.auth_admission.wait.duration",
+		metric.WithDescription("Time a request waited to acquire an authLimiter slot before its expensive auth/key-derivation section could start."),
+		metric.WithUnit("s"),
+	)
+	authInFlight, _ = authMeter.Int64UpDownCounter(
+		"safer.worker.auth_admission.in_flight",
+		metric.WithDescription("Number of GetUserContext/InitUserContext calls currently holding an authLimiter slot."),
+	)
+)
 
 // authLimiter bounds how many expensive authentication/key-derivation
 // sections run concurrently in this worker process.
@@ -68,10 +99,16 @@ func newAuthLimiter(n int) *authLimiter {
 // never given back. On failure (ctx.Err()) no slot was taken and there is
 // nothing to release.
 func (a *authLimiter) acquire(ctx context.Context) error {
+	start := time.Now()
 	select {
 	case a.sem <- struct{}{}:
+		authAdmissionWait.Record(ctx, time.Since(start).Seconds(),
+			metric.WithAttributes(attribute.String("outcome", "acquired")))
+		authInFlight.Add(ctx, 1)
 		return nil
 	case <-ctx.Done():
+		authAdmissionWait.Record(ctx, time.Since(start).Seconds(),
+			metric.WithAttributes(attribute.String("outcome", "cancelled")))
 		return ctx.Err()
 	}
 }
@@ -82,4 +119,5 @@ func (a *authLimiter) acquire(ctx context.Context) error {
 // bug in the caller, not a state authLimiter tries to tolerate.
 func (a *authLimiter) release() {
 	<-a.sem
+	authInFlight.Add(context.Background(), -1)
 }

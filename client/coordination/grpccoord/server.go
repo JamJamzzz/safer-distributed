@@ -51,6 +51,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -58,6 +63,62 @@ import (
 	"github.com/JamJamzzz/safer-distributed/client/lockmanager"
 	coordinatorv1 "github.com/JamJamzzz/safer-distributed/proto/coordinator/v1"
 )
+
+// tracer and meter are unconditional and safe with no telemetry backend
+// configured (see internal/telemetry's package doc): with no real
+// TracerProvider/MeterProvider installed, otel.Tracer/otel.Meter return
+// no-op implementations.
+var (
+	tracer = otel.Tracer("github.com/JamJamzzz/safer-distributed/client/coordination/grpccoord")
+	meter  = otel.Meter("github.com/JamJamzzz/safer-distributed/client/coordination/grpccoord")
+
+	// lockAcquireCount and lockWaitDuration answer "is lock contention the
+	// bottleneck?" (Phase 5's metrics requirement A). Attributes are
+	// mode, resource type, and outcome only -- never a resource key
+	// (a namespace or file identifier), which would be unbounded
+	// cardinality for no analytical benefit a low-cardinality label
+	// does not already provide.
+	lockAcquireCount, _ = meter.Int64Counter(
+		"safer.coordinator.lock.acquire.count",
+		otelmetric.WithDescription("Number of Acquire calls that actually waited on the LockManager, by outcome."),
+	)
+	lockWaitDuration, _ = meter.Float64Histogram(
+		"safer.coordinator.lock.wait.duration",
+		otelmetric.WithDescription("Time spent waiting inside LockManager.AcquireContext for a lock, by outcome."),
+		otelmetric.WithUnit("s"),
+	)
+
+	// leaseRevocationCount and cleanupRetryCount/cleanupFailureCount
+	// answer "are leases/fencing entering recovery paths?" (requirement
+	// C). A healthy deployment should see these stay at zero; any
+	// nonzero rate means workers are dying or stalling often enough for
+	// it to matter.
+	leaseRevocationCount = mustInt64Counter(meter, "safer.coordinator.lease.revocation.count",
+		"Number of transactions revoked because their lease passed without renewal.")
+	cleanupRetryCount = mustInt64Counter(meter, "safer.coordinator.fence.cleanup.retry.count",
+		"Number of times fence-invalidation cleanup was retried after a failure.")
+	cleanupFailureCount = mustInt64Counter(meter, "safer.coordinator.fence.cleanup.failure.count",
+		"Number of times fence-invalidation cleanup failed and locks were kept held on purpose.")
+)
+
+func mustInt64Counter(m otelmetric.Meter, name, description string) otelmetric.Int64Counter {
+	c, _ := m.Int64Counter(name, otelmetric.WithDescription(description))
+	return c
+}
+
+// resourceTypeLabel is the low-cardinality attribute value for a lock
+// resource's type -- never the resource's own key, which would be
+// unbounded (one value per namespace/file in the whole deployment).
+func resourceTypeLabel(t lockmanager.ResourceType) string {
+	switch t {
+	case lockmanager.NamespaceResource:
+		return "namespace"
+	case lockmanager.FileResource:
+		return "file"
+	default:
+		return "unknown"
+	}
+}
 
 // FenceStore is the durable fencing metadata the coordinator depends on.
 // *mongofence.Store implements it; tests substitute failing versions.
@@ -246,25 +307,56 @@ func (s *Server) Acquire(ctx context.Context, req *coordinatorv1.AcquireRequest)
 	// the table mutex briefly; the wait itself happens with no
 	// coordinator lock held, or the EndTransaction that would unblock it
 	// could never run.
-	waitCtx, cancel := context.WithCancel(ctx)
+	//
+	// This span and the metrics recorded alongside it exist to answer
+	// "is lock contention the bottleneck?" (Phase 5's metrics requirement
+	// A): attributes are the lock mode, the resource's TYPE, and the
+	// outcome -- never the resource's own key (a namespace or file
+	// identifier), which is exactly the kind of unbounded-cardinality
+	// label that would make this expensive to store and useless to
+	// aggregate on.
+	waitCtx, span := tracer.Start(ctx, "coordinator.lock_wait", trace.WithAttributes(
+		attribute.String("lock.mode", mode.String()),
+		attribute.String("resource.type", resourceTypeLabel(resource.Type)),
+	))
+	waitStart := time.Now()
+	waitCtx, cancel := context.WithCancel(waitCtx)
 	requestID := s.registry.registerPending(txn, cancel)
 	err = s.lm.AcquireContext(waitCtx, txn.internal, resource, mode)
 	s.registry.clearPending(txn, requestID)
 	cancel()
 
+	recordLockWait := func(outcome string) {
+		attrs := otelmetric.WithAttributes(
+			attribute.String("lock.mode", mode.String()),
+			attribute.String("resource.type", resourceTypeLabel(resource.Type)),
+			attribute.String("outcome", outcome),
+		)
+		lockAcquireCount.Add(ctx, 1, attrs)
+		lockWaitDuration.Record(ctx, time.Since(waitStart).Seconds(), attrs)
+		span.SetAttributes(attribute.String("lock.outcome", outcome))
+		span.End()
+	}
+
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			// The caller went away. The request left the queue; nothing
 			// is held. The worker still calls EndTransaction.
+			recordLockWait("caller_cancelled")
 			return nil, status.FromContextError(ctxErr).Err()
 		}
 		if waitCtx.Err() != nil {
 			// Cancelled by revocation rather than by the caller.
+			recordLockWait("revoked")
 			return nil, status.Errorf(codes.Aborted,
 				"grpccoord: transaction %s was revoked while waiting for %v", external, resource)
 		}
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
+		recordLockWait("failed")
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
+	recordLockWait("granted")
 
 	// Granted. From here, any failure must give the lock back rather than
 	// leave it held by a transaction the worker does not know succeeded.
@@ -392,8 +484,23 @@ func (s *Server) EndTransaction(ctx context.Context, req *coordinatorv1.EndTrans
 // A fence-store failure returns an error WITHOUT releasing anything. The
 // locks stay held on purpose: an unavailable resource is a much smaller
 // problem than two writers who both believe they hold it.
-func (s *Server) teardown(ctx context.Context, txn *transaction) (uint32, error) {
+func (s *Server) teardown(ctx context.Context, txn *transaction) (_ uint32, err error) {
+	// One span per teardown attempt (there can be several, via
+	// scheduleRetry, for one transaction) -- "lease revocation / fence
+	// cleanup" from Phase 5's list of useful coordinator spans.
+	// grants_count is a count, not an identifier, so it stays
+	// low-cardinality even though it varies per call.
+	ctx, span := tracer.Start(ctx, "coordinator.teardown")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	grants := s.fenceGrantsOf(txn)
+	span.SetAttributes(attribute.Int("grants_count", len(grants)))
 	if s.fences != nil {
 		for _, grant := range grants {
 			if err := s.fences.Invalidate(ctx, grant.Resource, grant.OwnerTxn); err != nil {
@@ -451,6 +558,7 @@ func (s *Server) revoke(external uuid.UUID) {
 		return
 	}
 	s.logf("grpccoord: lease expired for transaction %s, revoking", external)
+	leaseRevocationCount.Add(context.Background(), 1)
 
 	// 2. Cancel its in-flight Acquire requests, so a queued request
 	//    cannot be granted to a transaction being torn down.
@@ -465,6 +573,7 @@ func (s *Server) revoke(external uuid.UUID) {
 	if _, err := s.teardown(ctx, txn); err != nil {
 		s.logf("grpccoord: could not invalidate fencing state for %s; "+
 			"KEEPING ITS LOCKS HELD and retrying: %v", external, err)
+		cleanupFailureCount.Add(context.Background(), 1)
 		s.scheduleRetry(txn)
 		return
 	}
@@ -505,6 +614,7 @@ func (s *Server) scheduleRetry(txn *transaction) {
 					"its locks were never handed over", txn.external)
 				return
 			case <-ticker.C:
+				cleanupRetryCount.Add(context.Background(), 1)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				_, err := s.teardown(ctx, txn)
 				cancel()
@@ -512,6 +622,7 @@ func (s *Server) scheduleRetry(txn *transaction) {
 					s.logf("grpccoord: cleanup for %s succeeded on retry; locks released", txn.external)
 					return
 				}
+				cleanupFailureCount.Add(context.Background(), 1)
 				s.logf("grpccoord: cleanup for %s still failing, locks remain held: %v", txn.external, err)
 			}
 		}

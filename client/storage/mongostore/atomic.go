@@ -12,11 +12,50 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+
 	"github.com/JamJamzzz/safer-distributed/client/fencing"
 	"github.com/JamJamzzz/safer-distributed/client/storage"
 )
 
 var _ storage.Atomic = (*Store)(nil)
+
+// tracer and meter name this package's telemetry distinctly from the
+// gRPC-boundary instrumentation elsewhere (cmd/worker, cmd/coordinator,
+// grpccoord): this is the one manual span, and the one metric, the
+// storage layer contributes -- see RunAtomic. Both are unconditional and
+// safe with no telemetry backend configured (see internal/telemetry's
+// package doc): with no real TracerProvider/MeterProvider installed,
+// otel.Tracer/otel.Meter return no-op implementations and every call
+// below is a cheap no-op.
+var (
+	tracer = otel.Tracer("github.com/JamJamzzz/safer-distributed/client/storage/mongostore")
+	meter  = otel.Meter("github.com/JamJamzzz/safer-distributed/client/storage/mongostore")
+
+	// transactionDuration answers "is Mongo transaction time dominant?"
+	// (Phase 5's metrics requirement D): one histogram, split only by
+	// outcome (committed/error) -- never by anything identifying the
+	// object graph the transaction touched.
+	transactionDuration, _ = meter.Float64Histogram(
+		"safer.storage.transaction.duration",
+		metric.WithDescription("Duration of one SAFER multi-object MongoDB transaction (RunAtomic)."),
+		metric.WithUnit("s"),
+	)
+
+	// fenceRejectionCount is the worker-side half of "are leases/fencing
+	// entering recovery paths?" (requirement C): a commit refused because
+	// its fencing token was no longer current. A healthy deployment
+	// should see this stay at zero; see grpccoord's
+	// safer.coordinator.lease.revocation.count for the coordinator-side
+	// counterpart.
+	fenceRejectionCount, _ = meter.Int64Counter(
+		"safer.storage.fence.rejection.count",
+		metric.WithDescription("Number of commits refused because a fencing token was no longer current."),
+	)
+)
 
 // RunAtomic runs fn inside one MongoDB transaction.
 //
@@ -43,7 +82,27 @@ var _ storage.Atomic = (*Store)(nil)
 // Requires a replica set (or sharded cluster). A standalone mongod cannot
 // serve transactions, and reports that plainly rather than silently
 // writing without one.
-func (s *Store) RunAtomic(ctx context.Context, fn func(ctx context.Context) error) error {
+func (s *Store) RunAtomic(ctx context.Context, fn func(ctx context.Context) error) (err error) {
+	// One span marking the atomic transaction boundary -- not a span per
+	// statement inside it, which would multiply per query and answer a
+	// question ("which query was slow") this repository is not trying to
+	// answer yet. attribute values are the transaction's outcome only, no
+	// object identifiers or content.
+	ctx, span := tracer.Start(ctx, "mongostore.run_atomic")
+	start := time.Now()
+	defer func() {
+		outcome := "committed"
+		if err != nil {
+			outcome = "error"
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.SetAttributes(attribute.String("mongostore.outcome", outcome))
+		transactionDuration.Record(ctx, time.Since(start).Seconds(),
+			metric.WithAttributes(attribute.String("outcome", outcome)))
+		span.End()
+	}()
+
 	if fn == nil {
 		return fmt.Errorf("mongostore: RunAtomic requires a function")
 	}
@@ -151,7 +210,13 @@ func (s *Store) validateFences(sessionCtx mongo.SessionContext, operationCtx con
 		if result.MatchedCount == 0 {
 			// The lock moved on without this transaction. Aborting is
 			// the correct outcome: its writes were computed against
-			// state it no longer owns.
+			// state it no longer owns. Counted separately from the
+			// coordinator's own lease/cleanup metrics (grpccoord) since
+			// this is the OTHER half of "are leases/fencing entering
+			// recovery paths?" (Phase 5's metrics requirement C): a
+			// worker whose commit was refused here, not a coordinator
+			// that revoked a lease.
+			fenceRejectionCount.Add(operationCtx, 1)
 			return fmt.Errorf("mongostore: %s: %w", grant, fencing.ErrStaleFence)
 		}
 	}

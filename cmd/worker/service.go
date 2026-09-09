@@ -4,12 +4,19 @@ import (
 	"context"
 	"errors"
 
+	"go.opentelemetry.io/otel"
+	otelcodes "go.opentelemetry.io/otel/codes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/JamJamzzz/safer-distributed/client"
 	workerv1 "github.com/JamJamzzz/safer-distributed/proto/worker/v1"
 )
+
+// tracer is unconditional and safe with no telemetry backend configured
+// (see internal/telemetry's package doc): with no real TracerProvider
+// installed, otel.Tracer returns a no-op implementation.
+var tracer = otel.Tracer("github.com/JamJamzzz/safer-distributed/cmd/worker")
 
 // saferWorkerServer adapts SAFER's existing client API
 // (github.com/JamJamzzz/safer-distributed/client) to the worker.v1.SaferWorker
@@ -31,14 +38,13 @@ import (
 // boundary the way it did before those variants existed (see
 // client.InitUserContext and friends, and their package doc for why the
 // legacy context-free methods -- still used by V1 callers -- could not
-// simply be changed in place).
-//
-// authLimiter bounds how many of this process's calls are inside
-// InitUserContext's key generation or GetUserContext's Argon2 key
-// derivation at once -- see authlimit.go for why: each such call is
-// genuinely memory-heavy, and an unbounded number of them running at
-// once in one process has no ceiling a static memory limit can be sized
-// against.
+// simply be changed in place). It is also the substrate distributed
+// tracing rides on: main.go's otelgrpc server handler extracts whatever
+// trace context the caller (cmd/loadgen) propagated onto ctx, and every
+// span this file starts from that ctx -- worker.authenticate,
+// safer.<Operation> -- becomes a child of it, and ctx carries that span
+// context further into guard.AcquireContext (grpccoord's client span)
+// and the MongoDB transaction (mongostore's span), all in one trace.
 type saferWorkerServer struct {
 	workerv1.UnimplementedSaferWorkerServer
 	authLimiter *authLimiter
@@ -55,7 +61,12 @@ func (s *saferWorkerServer) InitUser(ctx context.Context, req *workerv1.InitUser
 		return nil, translateErr(ctx, "InitUser", err)
 	}
 	defer s.authLimiter.release()
-	if _, err := client.InitUserContext(ctx, req.GetUsername(), req.GetPassword()); err != nil {
+
+	err := traced(ctx, "safer.InitUser", func(ctx context.Context) error {
+		_, err := client.InitUserContext(ctx, req.GetUsername(), req.GetPassword())
+		return err
+	})
+	if err != nil {
 		return nil, translateErr(ctx, "InitUser", err)
 	}
 	return &workerv1.InitUserResponse{}, nil
@@ -69,7 +80,10 @@ func (s *saferWorkerServer) StoreFile(ctx context.Context, req *workerv1.StoreFi
 	if req.GetFilename() == "" {
 		return nil, status.Error(codes.InvalidArgument, "worker: filename is required")
 	}
-	if err := user.StoreFileContext(ctx, req.GetFilename(), req.GetContent()); err != nil {
+	err = traced(ctx, "safer.StoreFile", func(ctx context.Context) error {
+		return user.StoreFileContext(ctx, req.GetFilename(), req.GetContent())
+	})
+	if err != nil {
 		return nil, translateErr(ctx, "StoreFile", err)
 	}
 	return &workerv1.StoreFileResponse{}, nil
@@ -83,7 +97,10 @@ func (s *saferWorkerServer) AppendToFile(ctx context.Context, req *workerv1.Appe
 	if req.GetFilename() == "" {
 		return nil, status.Error(codes.InvalidArgument, "worker: filename is required")
 	}
-	if err := user.AppendToFileContext(ctx, req.GetFilename(), req.GetContent()); err != nil {
+	err = traced(ctx, "safer.AppendToFile", func(ctx context.Context) error {
+		return user.AppendToFileContext(ctx, req.GetFilename(), req.GetContent())
+	})
+	if err != nil {
 		return nil, translateErr(ctx, "AppendToFile", err)
 	}
 	return &workerv1.AppendToFileResponse{}, nil
@@ -97,7 +114,12 @@ func (s *saferWorkerServer) LoadFile(ctx context.Context, req *workerv1.LoadFile
 	if req.GetFilename() == "" {
 		return nil, status.Error(codes.InvalidArgument, "worker: filename is required")
 	}
-	content, err := user.LoadFileContext(ctx, req.GetFilename())
+	var content []byte
+	err = traced(ctx, "safer.LoadFile", func(ctx context.Context) error {
+		var err error
+		content, err = user.LoadFileContext(ctx, req.GetFilename())
+		return err
+	})
 	if err != nil {
 		return nil, translateErr(ctx, "LoadFile", err)
 	}
@@ -110,7 +132,19 @@ func (s *saferWorkerServer) LoadFile(ctx context.Context, req *workerv1.LoadFile
 // The GetUserContext call itself -- Argon2 key derivation -- is gated by
 // limiter, not the validation around it: an empty username/password is
 // cheap to reject and should not wait for an admission slot meant for
-// expensive work.
+// expensive work. The whole gated section is one span
+// ("worker.authenticate"), the same span Phase 5's metrics requirement B
+// is about: how much of a request's latency this section -- admission
+// wait plus the Argon2 call itself -- actually accounts for, visible
+// directly in the trace alongside the lock-wait and Mongo-transaction
+// spans elsewhere in the same request.
+//
+// No password, derived key, or file content ever becomes a span
+// attribute here or anywhere else in this file -- see this repository's
+// Phase 5 telemetry policy in docs/distributed-roadmap.md. Nor does the
+// username: it identifies a specific SAFER account, which is exactly the
+// kind of high-cardinality, potentially sensitive identifier Phase 5
+// deliberately keeps out of span attributes.
 func authenticate(ctx context.Context, limiter *authLimiter, username, password string) (*client.User, error) {
 	if username == "" {
 		return nil, status.Error(codes.InvalidArgument, "worker: username is required")
@@ -118,15 +152,36 @@ func authenticate(ctx context.Context, limiter *authLimiter, username, password 
 	if password == "" {
 		return nil, status.Error(codes.InvalidArgument, "worker: password is required")
 	}
-	if err := limiter.acquire(ctx); err != nil {
-		return nil, translateErr(ctx, "GetUser", err)
-	}
-	defer limiter.release()
-	user, err := client.GetUserContext(ctx, username, password)
+
+	var user *client.User
+	err := traced(ctx, "worker.authenticate", func(ctx context.Context) error {
+		if err := limiter.acquire(ctx); err != nil {
+			return err
+		}
+		defer limiter.release()
+		var err error
+		user, err = client.GetUserContext(ctx, username, password)
+		return err
+	})
 	if err != nil {
 		return nil, translateErr(ctx, "GetUser", err)
 	}
 	return user, nil
+}
+
+// traced runs fn inside a span named name, recording fn's error (if any)
+// on the span before returning it unchanged. It exists so every manual
+// span in this file follows the same shape -- start, run, record outcome,
+// end -- rather than repeating that boilerplate at each call site.
+func traced(ctx context.Context, name string, fn func(ctx context.Context) error) error {
+	ctx, span := tracer.Start(ctx, name)
+	defer span.End()
+	if err := fn(ctx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
+		return err
+	}
+	return nil
 }
 
 // translateErr reports a SAFER operation failure as a gRPC status.
