@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,33 @@ type Report struct {
 	Succeeded int64
 	Failed    int64
 	Elapsed   time.Duration
+
+	// LatencySamples, P50Latency, P95Latency and P99Latency describe the
+	// end-to-end latency of SUCCESSFUL timed workload operations, measured
+	// client-side around runOne and nothing else. setup (InitUser and the
+	// initial StoreFile), the post-run oracle verification, process
+	// startup, and the gRPC dial are all deliberately outside the measured
+	// window -- none of them is load, and counting them would inflate
+	// exactly the numbers a later evidence pass depends on.
+	//
+	// Only successful operations contribute a sample, so LatencySamples
+	// equals Succeeded for a normally completed run. A failed operation is
+	// still counted in Failed and still surfaces in FirstErrors, exactly as
+	// before; it simply does not put failure latency -- frequently a
+	// callTimeout, which would silently dominate the tail -- into a
+	// distribution labelled as successful-operation latency.
+	//
+	// These samples are UNSAMPLED, which is the whole reason they exist.
+	// Datadog's indexed APM spans are a retained subset (one 200-operation
+	// run was observed contributing far fewer indexed spans than it
+	// executed), so retained traces remain useful for trace shape and tail
+	// examples but cannot support benchmark-wide percentiles. These are
+	// latencies of this development deployment under one run's load; they
+	// are not production latency figures.
+	LatencySamples int
+	P50Latency     time.Duration
+	P95Latency     time.Duration
+	P99Latency     time.Duration
 
 	FirstErrors []string // up to a handful of distinct error messages, for diagnosis
 
@@ -77,6 +105,11 @@ func (r Report) String() string {
 	rate := float64(r.Succeeded) / r.Elapsed.Seconds()
 	s := fmt.Sprintf("workload=%s attempted=%d succeeded=%d failed=%d elapsed=%s throughput=%.1f ops/s",
 		r.Workload, r.Attempted, r.Succeeded, r.Failed, r.Elapsed.Round(time.Millisecond), rate)
+	s += fmt.Sprintf("\nlatency_samples=%d p50=%s p95=%s p99=%s",
+		r.LatencySamples,
+		r.P50Latency.Round(time.Microsecond),
+		r.P95Latency.Round(time.Microsecond),
+		r.P99Latency.Round(time.Microsecond))
 	s += fmt.Sprintf("\nreplicas_served=%d %v", len(r.Replicas), r.Replicas)
 	for _, e := range r.FirstErrors {
 		s += fmt.Sprintf("\n  error: %s", e)
@@ -300,6 +333,36 @@ func checkOracles(ctx context.Context, cfg Config, client workerv1.SaferWorkerCl
 	return dataFailures, verificationErrors
 }
 
+// percentile returns the p-quantile of an ALREADY-SORTED slice; callers
+// sort once after collection rather than paying for it per sample.
+//
+// The convention -- a truncated index into len-1 -- is deliberately
+// identical to cmd/benchmark's own percentile helper, so a number produced
+// here is computed the same way as one from the V1 local-strategy
+// benchmark and the two can be read side by side without a footnote about
+// quantile definitions. It is copied rather than imported on purpose:
+// cmd/benchmark measures a different system (process-local concurrency
+// strategies over userlib storage) and those two bodies of evidence are
+// kept architecturally separate, so coupling this package to it to share
+// nine lines would be the wrong trade.
+//
+// Small inputs are handled by the same clamp: an empty slice has no
+// percentile and returns 0, and any single-element slice returns that
+// element for every p.
+func percentile(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(p * float64(len(sorted)-1))
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
 // runWorkload executes cfg's workload against conn and returns a Report.
 //
 // Work is divided by a shared atomic counter, not by giving each goroutine
@@ -307,7 +370,16 @@ func checkOracles(ctx context.Context, cfg Config, client workerv1.SaferWorkerCl
 // (WorkloadSameFileWrites, by design) should not leave its share of the
 // work undone while idle goroutines have nothing left to do.
 func runWorkload(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report, error) {
-	client := workerv1.NewSaferWorkerClient(conn)
+	return runWorkloadClient(ctx, cfg, workerv1.NewSaferWorkerClient(conn))
+}
+
+// runWorkloadClient is runWorkload's body against an already-constructed
+// client. Splitting it out changes no behavior and exists so the run loop
+// itself -- in particular which operations do and do not contribute a
+// latency sample -- is testable against the in-memory fake in
+// workload_test.go. It is the same seam setup, runOne and checkOracles
+// already take; only runWorkload took a raw connection.
+func runWorkloadClient(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient) (Report, error) {
 	tally := newReplicaTally()
 
 	users, err := setup(ctx, cfg, client, tally)
@@ -321,6 +393,12 @@ func runWorkload(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report
 	var attempted, succeeded, failed int64
 	var errMu sync.Mutex
 	var firstErrors []string
+	// Latency samples are accumulated in a per-caller slice and merged into
+	// this one exactly once, when that caller finishes -- not under a
+	// shared lock per operation. This is measurement code: it must not
+	// introduce per-operation contention into the thing it is measuring.
+	var latMu sync.Mutex
+	var latencies []time.Duration
 	recordErr := func(err error) {
 		errMu.Lock()
 		defer errMu.Unlock()
@@ -345,6 +423,20 @@ func runWorkload(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report
 		go func(callerIndex int) {
 			defer wg.Done()
 			u := callerUser(users, callerIndex)
+			// Merged before wg.Done() runs: deferred calls run
+			// last-in-first-out, so this is registered after wg.Done() and
+			// therefore executes before it. wg.Wait() below consequently
+			// returns only once every caller's samples are already in
+			// latencies, which is what makes the sort that follows safe.
+			local := make([]time.Duration, 0, 128)
+			defer func() {
+				if len(local) == 0 {
+					return
+				}
+				latMu.Lock()
+				latencies = append(latencies, local...)
+				latMu.Unlock()
+			}()
 			for {
 				if cfg.Duration > 0 {
 					if time.Now().After(deadline) {
@@ -355,7 +447,12 @@ func runWorkload(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report
 				}
 
 				callCtx, cancel := context.WithTimeout(ctx, callTimeout)
+				// The measured window is exactly runOne and nothing else:
+				// the context setup above and the cancel below are this
+				// tool's own bookkeeping, not the operation being measured.
+				opStart := time.Now()
 				err := runOne(callCtx, cfg, client, tally, u, content, initialContent)
+				opLatency := time.Since(opStart)
 				cancel()
 
 				atomic.AddInt64(&attempted, 1)
@@ -364,12 +461,18 @@ func runWorkload(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report
 					recordErr(err)
 				} else {
 					atomic.AddInt64(&succeeded, 1)
+					local = append(local, opLatency)
 				}
 			}
 		}(i)
 	}
 	wg.Wait()
 	elapsed := time.Since(start)
+
+	// Safe without latMu: every caller merged its samples before its
+	// wg.Done() ran (see the deferred merge above), so wg.Wait() returning
+	// establishes that nothing else can touch latencies.
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 
 	// Oracle verification happens after the timed run, exactly like
 	// setup: it is a correctness check, not load, and must not be
@@ -383,6 +486,10 @@ func runWorkload(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report
 		Succeeded:          succeeded,
 		Failed:             failed,
 		Elapsed:            elapsed,
+		LatencySamples:     len(latencies),
+		P50Latency:         percentile(latencies, 0.50),
+		P95Latency:         percentile(latencies, 0.95),
+		P99Latency:         percentile(latencies, 0.99),
 		FirstErrors:        firstErrors,
 		Replicas:           tally.snapshot(),
 		OracleFailures:     oracleFailures,

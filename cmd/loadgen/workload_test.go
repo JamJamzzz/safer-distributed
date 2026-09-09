@@ -34,9 +34,19 @@ type fakeWorkerClient struct {
 	// simulating a worker that is unavailable when checkOracles tries to
 	// verify, as opposed to one that is up and returning wrong bytes.
 	failLoadFile bool
+
+	// failAppendEvery, if positive, makes every failAppendEvery-th
+	// AppendToFile call across the whole fake (1-based) return an error
+	// without writing -- a genuinely failed operation, as opposed to
+	// dropAppendNumber's silent lost update, which reports success. Driven
+	// at concurrency 1 it makes the success/failure split deterministic.
+	failAppendEvery int32
 }
 
-var errFakeLoadFileUnavailable = errors.New("fake: worker unavailable")
+var (
+	errFakeLoadFileUnavailable = errors.New("fake: worker unavailable")
+	errFakeAppendFailed        = errors.New("fake: append rejected")
+)
 
 func newFakeWorkerClient() *fakeWorkerClient {
 	return &fakeWorkerClient{files: make(map[string][]byte)}
@@ -58,6 +68,12 @@ func (f *fakeWorkerClient) AppendToFile(_ context.Context, in *workerv1.AppendTo
 	if f.dropAppendNumber > 0 && n == f.dropAppendNumber {
 		// The lost update itself: report success, write nothing.
 		return &workerv1.AppendToFileResponse{}, nil
+	}
+	if f.failAppendEvery > 0 && n%f.failAppendEvery == 0 {
+		// An honestly failed operation: no write, and an error the caller
+		// sees. Unlike the drop above, this must NOT be counted as a
+		// success anywhere.
+		return nil, errFakeAppendFailed
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
