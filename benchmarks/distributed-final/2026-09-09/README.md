@@ -42,9 +42,11 @@ measurements, not production capacity claims**.
 The primary experiment is a **matched A/B**: `independent-writes` versus
 `same-file-writes`. Both execute `AppendToFile` with identical concurrency,
 operation count, content size, worker count, auth settings and resource
-limits. The single deliberate difference is the sharing shape — a separate
+limits. The primary experimental contrast is the sharing shape — a separate
 user and file per caller, versus one shared user and file across all callers
-(which forces serialization on one exclusive file lock).
+(which forces serialization on one exclusive file lock). Because that also
+changes the user/file working set, this is a matched workload comparison
+rather than a perfectly isolated lock microbenchmark.
 
 - 4 concurrency levels (1, 2, 4, 8) × 2 workloads × 3 repetitions =
   **24 primary runs**, `-count=500` each

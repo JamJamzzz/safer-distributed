@@ -136,11 +136,11 @@ The headline results, at commit `3fa018e`:
   with zero failures, zero lost updates caught by the load generator's own data
   oracle, and no worker or coordinator restarts. All three replicas served every
   run, verified per-RPC rather than assumed.
-- **A matched A/B isolated the cost of contention.** `same-file-writes` (all
-  callers serialized on one exclusive file lock) was compared against
-  `independent-writes` (a file per caller) under otherwise identical settings. At
-  concurrency ≤ 8 the contended workload showed no repeatable throughput penalty
-  distinguishable from run-to-run variation.
+- **A matched A/B controlled for operation type while contrasting contention
+  shape.** `same-file-writes` (all callers serialized on one exclusive file lock)
+  was compared against `independent-writes` (a file per caller) under otherwise
+  identical settings. At concurrency ≤ 8 the contended workload showed no
+  repeatable throughput penalty distinguishable from run-to-run variation.
 - **Observability showed why that is not the whole story.** Datadog recorded
   lock-manager wait rising about three orders of magnitude under contention, from
   tens of microseconds to tens of milliseconds. Coordination cost was real; it
