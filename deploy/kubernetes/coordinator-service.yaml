@@ -1,0 +1,18 @@
+# A ClusterIP Service in front of the single coordinator pod. This exists
+# for a stable DNS name (safer-coordinator, referenced by configmap.yaml's
+# SAFER_COORDINATOR_ADDR), not for load balancing across replicas -- there
+# is deliberately only ever one coordinator pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: safer-coordinator
+  namespace: safer-distributed
+  labels:
+    app: safer-coordinator
+spec:
+  selector:
+    app: safer-coordinator
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc

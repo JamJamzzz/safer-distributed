@@ -1,0 +1,38 @@
+# OPTIONAL, and NOT applied by kustomization.yaml.
+#
+# This repository does not deploy MongoDB itself -- see docker/README.md:
+# it is a managed/external dependency, the same way CI runs it from the
+# upstream mongo:7 image rather than a custom build. Because of that, this
+# file is a template for the case where a deployment DOES run MongoDB as
+# an in-cluster pod (e.g. a StatefulSet labeled app=mongo in this
+# namespace): apply it only then, and adjust the podSelector/ports to
+# match that deployment's actual labels.
+#
+# If MongoDB is external to the cluster (Atlas, a managed service, a VM),
+# this NetworkPolicy does nothing for it, and access is restricted instead
+# at whatever boundary that MongoDB deployment actually has -- its own
+# firewall/security-group rules, IP allowlisting, or VPC peering. That is
+# outside this repository's scope, and this file does not pretend
+# otherwise.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-ingress
+  namespace: safer-distributed
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: safer-worker
+        - podSelector:
+            matchLabels:
+              app: safer-coordinator
+      ports:
+        - protocol: TCP
+          port: 27017

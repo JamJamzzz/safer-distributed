@@ -1,0 +1,21 @@
+# kubectl apply -k deploy/kubernetes
+#
+# Brings up the namespace, coordinator, and workers. Deliberately NOT
+# included here:
+#
+#   - secret.yaml is a local/dev PLACEHOLDER (see its own comments); a
+#     real deployment creates that Secret out-of-band and should not
+#     apply this repository's copy of it.
+#   - loadgen-job.yaml is a one-shot Job, applied on demand after the
+#     Deployments are up and ready, not part of standing infrastructure.
+#   - networkpolicy-mongo-optional.yaml only applies if MongoDB itself
+#     runs as an in-cluster pod, which this repository's manifests do not
+#     provide (see docker/README.md and that file's own comments).
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - coordinator-deployment.yaml
+  - coordinator-service.yaml
+  - worker-deployment.yaml
+  - worker-service.yaml
+  - networkpolicy.yaml

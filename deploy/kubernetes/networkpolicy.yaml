@@ -1,0 +1,78 @@
+# Network isolation for Phase 4.5.
+#
+# The coordinator's gRPC transport is unauthenticated at the application
+# layer (see client/coordination/grpccoord's package doc): SAFER's objects
+# are encrypted and authenticated before anything reaches storage, so this
+# channel carries no plaintext content and no key material, only resource
+# identifiers and lock modes -- but nothing stops a pod that can merely
+# REACH the coordinator from forging lock traffic. Phase 4 does not build
+# mTLS or any other cryptographic service authentication for it (out of
+# scope for this phase); instead these NetworkPolicies restrict WHICH pods
+# can reach the coordinator and the workers at the network layer.
+#
+# What this earns: a workload elsewhere in the cluster cannot reach the
+# coordinator or the workers at all. What it does NOT earn: authentication
+# of traffic that legitimately originates from an allowed pod. The
+# remaining trust assumption is explicit -- a trusted Kubernetes cluster
+# network and authorized pods within this namespace -- and is not claimed
+# to be equivalent to cryptographic authentication.
+#
+# default-deny-ingress makes the allow rules below meaningful: without it,
+# any pod that could reach the namespace's pod network at all would reach
+# the coordinator and workers by default.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: safer-distributed
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# Only worker pods may reach the coordinator. Nothing else in the
+# namespace -- and nothing outside it -- has a network path to it. This is
+# the concrete form of "coordinator ingress restricted to intended SAFER
+# worker pods".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: coordinator-ingress
+  namespace: safer-distributed
+spec:
+  podSelector:
+    matchLabels:
+      app: safer-coordinator
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: safer-worker
+      ports:
+        - protocol: TCP
+          port: 50051
+---
+# Workers are the intended point of contact for clients (loadgen, and any
+# real caller), so their ingress is scoped to this namespace rather than
+# to one named caller -- but still not open to the whole cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-ingress
+  namespace: safer-distributed
+spec:
+  podSelector:
+    matchLabels:
+      app: safer-worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: safer-distributed
+      ports:
+        - protocol: TCP
+          port: 50052

@@ -1,0 +1,79 @@
+# Workers are stateless (see cmd/worker's package doc) and safely
+# replicated: correctness under concurrent replicas comes from the shared
+# coordinator's strict 2PL and fencing, not from anything workers
+# coordinate among themselves. RollingUpdate (the Kubernetes default) is
+# fine here, unlike the coordinator.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safer-worker
+  namespace: safer-distributed
+  labels:
+    app: safer-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: safer-worker
+  template:
+    metadata:
+      labels:
+        app: safer-worker
+    spec:
+      # Bounded by cmd/worker's own -shutdown-timeout (25s default): give
+      # Kubernetes a little more than that before it SIGKILLs, so the
+      # worker's own bounded GracefulStop is what ends the pod in the
+      # normal case, not an external kill.
+      terminationGracePeriodSeconds: 35
+      containers:
+        - name: worker
+          image: safer-worker:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-addr=0.0.0.0:50052"
+          ports:
+            - name: grpc
+              containerPort: 50052
+          envFrom:
+            - configMapRef:
+                name: safer-config
+            - secretRef:
+                name: safer-mongo-credentials
+          # Readiness and liveness are deliberately different checks (see
+          # cmd/worker/health.go).
+          #
+          # Readiness (the default/"" gRPC health service) reflects
+          # MongoDB and coordinator reachability: an unready worker is
+          # taken out of the Service's endpoint list, so Kubernetes
+          # routes new requests to a replica that can actually serve them.
+          readinessProbe:
+            grpc:
+              port: 50052
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          # Liveness only asks "is this process's serve loop alive", and
+          # is set once at startup, never toggled by a downstream outage.
+          # A shared MongoDB or coordinator outage must not fail every
+          # worker replica's liveness probe at once -- that would make
+          # Kubernetes kill and restart the entire fleet simultaneously,
+          # which cannot repair an outage in a dependency and can only
+          # add a thundering restart on top of it.
+          livenessProbe:
+            grpc:
+              port: 50052
+              service: liveness
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            # Conservative development defaults, not derived from any
+            # benchmark (see docs/distributed-roadmap.md and cmd/loadgen,
+            # which is functional/correctness tooling for this phase, not
+            # a sizing tool yet).
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

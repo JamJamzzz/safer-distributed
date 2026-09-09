@@ -1,0 +1,17 @@
+# Non-sensitive configuration. MongoDB credentials are deliberately not
+# here -- see secret.yaml -- everything below is safe to read in plain
+# text (coordinator address, database name, timeout settings).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: safer-config
+  namespace: safer-distributed
+data:
+  # The coordinator Service DNS name (see coordinator-service.yaml),
+  # resolvable from any pod in this namespace.
+  SAFER_COORDINATOR_ADDR: "safer-coordinator:50051"
+  SAFER_COORDINATOR_TIMEOUT: "10s"
+
+  SAFER_MONGO_DB: "safer"
+  SAFER_MONGO_TIMEOUT: "10s"
+  SAFER_MONGO_TXN_TIMEOUT: "30s"

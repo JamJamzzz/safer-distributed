@@ -1,0 +1,79 @@
+# The coordinator is a single point of coordination BY DESIGN (see
+# docs/distributed-roadmap.md's "No coordinator fault tolerance"): its lock
+# table is in-memory, and two coordinators serving at once would each have
+# an independent lock table and split coordination between workers. Two
+# things follow directly from that, both deliberate:
+#
+#   - replicas: 1, always.
+#   - strategy: Recreate, NOT the Kubernetes default RollingUpdate.
+#     RollingUpdate would run the old and new pod at once during a
+#     rollout, which is exactly the two-coordinators-at-once scenario
+#     above. Recreate tears down the old pod before creating the new one,
+#     so there is a real (if brief) coordination outage during every
+#     coordinator rollout -- deployment availability is traded for
+#     coordination safety. This is not high availability, and no leader
+#     election or consensus is added to make it one (out of scope; see
+#     the roadmap).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safer-coordinator
+  namespace: safer-distributed
+  labels:
+    app: safer-coordinator
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: safer-coordinator
+  template:
+    metadata:
+      labels:
+        app: safer-coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: safer-coordinator:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-addr=0.0.0.0:50051"
+            # Conservative development defaults, not benchmark-derived
+            # (see docs/distributed-roadmap.md and cmd/coordinator's
+            # DefaultLeaseDuration/DefaultSweepInterval for what "default"
+            # actually means here).
+            - "-lease=6s"
+            - "-sweep=500ms"
+          ports:
+            - name: grpc
+              containerPort: 50051
+          envFrom:
+            - configMapRef:
+                name: safer-config
+            - secretRef:
+                name: safer-mongo-credentials
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            # Conservative development defaults, not derived from any
+            # benchmark. The coordinator's memory footprint scales with
+            # active transactions and held locks, which no load test in
+            # this repository has sized yet (see docs/distributed-
+            # roadmap.md and cmd/loadgen).
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
