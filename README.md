@@ -43,6 +43,18 @@ fencing prevents.
 The single coordinator remains an explicit failure domain: fence state is durable, but
 lock state is in memory, so a coordinator crash still loses who held what.
 
+Phase 4 turns this into a deployable service. `cmd/worker` is a real, long-running,
+stateless worker process (distinct from `cmd/saferworker`, the single-operation test
+helper the crossprocess harness spawns and kills per call), serving
+[worker.v1.SaferWorker](proto/worker/v1/worker.proto) over gRPC. `cmd/coordinator` now
+fails closed rather than warning-and-continuing when no durable fencing store is
+configured. `cmd/loadgen` drives functional/correctness load against the worker
+Service. `docker/` containerizes all three, and `deploy/kubernetes/` deploys 3 worker
+replicas behind one Service and a singleton coordinator with a no-overlap rollout
+strategy, with distinct readiness/liveness health checks and NetworkPolicy-based
+isolation. See [docs/distributed-roadmap.md](docs/distributed-roadmap.md#cloud-native-deployment-phase-4)
+and each directory's own README for what was actually run versus statically validated.
+
 ## CI and concurrency verification
 
 To run all packages, including the white-box, black-box, lock-manager, and

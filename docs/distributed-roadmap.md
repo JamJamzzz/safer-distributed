@@ -84,6 +84,7 @@ V1 is correct and well tested **within one process**. Its two structural limits:
 - **Phase 3B — Atomic MongoDB persistence.** Done. See "Multi-object writes are
   atomic" below.
 - **Phase 3C — Worker-failure recovery.** Done. See "Worker failure" below.
+- **Phase 4 — Cloud-native deployment.** Done. See "Cloud-native deployment" below.
 
 Cryptography, authenticated envelopes, UUID addressing, authorization/capability
 semantics, Namespace/File resources, Version/Epoch behavior, and the public SAFER API
@@ -385,6 +386,162 @@ default 30s) when the caller supplied none. Phase 3B's decision to add no
 the whole transaction, so ordinary contention would look like failure - but an
 unbounded transaction could hold a lease alive indefinitely, and now cannot.
 
+## Cloud-native deployment (Phase 4)
+
+Phases 1-3C built the correctness machinery: durable storage, remote strict-2PL
+coordination, atomic multi-object mutations, and worker-crash recovery with fencing.
+Phase 4 turns that into something actually deployable -- Docker images and a
+Kubernetes topology -- without adding any new distributed algorithm. Nothing here
+changes SAFER's cryptography, storage, or locking semantics; everything is an
+additive adapter around the client package Phases 1-3C already built.
+
+### The coordinator fails closed
+
+Before Phase 4, `cmd/coordinator` started with no fencing store logged a warning and
+served remote X-lock coordination anyway -- functional, but with no stale-writer
+protection at all. That is no longer the default: `cmd/coordinator` now refuses to
+start unless it has a durable, reachable fence store. `-allow-unfenced` is the
+explicit, loudly-logged escape hatch for local development and tests that only
+exercise lock semantics; it is never appropriate in production. Library-level
+constructors (`grpccoord.NewServer` / `NewServerWithConfig`) are unchanged and still
+accept a nil `FenceStore`, since some of their own tests need exactly that.
+
+### A real worker service
+
+`cmd/saferworker` was always a test helper: the crossprocess harness spawns one
+process per operation and reads a single JSON result line off stdout. It was never
+meant to be what a deployment actually runs. `cmd/worker` is: a long-running process
+that installs a MongoDB backend and a remote coordinator into the client package once
+at startup and serves `worker.v1.SaferWorker` (`InitUser`, `StoreFile`,
+`AppendToFile`, `LoadFile` -- the minimum needed to drive a realistic load test, not a
+mechanical export of every SAFER method) over gRPC indefinitely.
+
+It holds no per-user session state between calls: every RPC carries a username and
+password, and SAFER derives that user's keys fresh from them each time
+(`client.GetUser`), exactly as it always has. That is what makes the worker safely
+replicable -- any replica can serve any request, and a replica can be added, removed,
+or restarted without losing anything a client needs. Startup fails closed exactly
+like the coordinator: no MongoDB or no coordinator configured means the process does
+not start in some degraded mode, it exits.
+
+Readiness and liveness are deliberately different checks, both served over the
+standard `grpc.health.v1` health-checking protocol so Kubernetes' native gRPC probes
+can target them directly:
+
+- **Readiness** (the protocol's default, empty-string service name) tracks whether
+  MongoDB and the coordinator are currently reachable. An unready worker is exactly
+  what should happen when a downstream dependency is having a bad day -- Kubernetes
+  stops routing new requests to that replica.
+- **Liveness** (service name `"liveness"`) is set once at startup and never touched
+  again. It answers "is this process's serve loop alive", not "are my dependencies
+  healthy". If it mirrored readiness, a shared MongoDB or coordinator outage would
+  fail every replica's liveness probe simultaneously, and Kubernetes would kill and
+  restart the entire worker fleet at once -- which cannot fix an outage in a
+  dependency and can only add a thundering restart on top of it.
+
+On SIGTERM the worker marks itself unready first (so Kubernetes stops sending new
+traffic immediately, before anything else happens), then `GracefulStop`s its gRPC
+server so in-flight requests finish, with a bounded forced-stop fallback
+(`-shutdown-timeout`, default 25s) so a wedged request cannot hang shutdown forever.
+This is an operational optimization layered on top of Phase 3C, not a second
+correctness mechanism: a worker that is SIGKILLed with no graceful shutdown at all is
+exactly the "killed worker" scenario Phase 3C's leases and fencing already handle.
+
+### Containerization
+
+Three images (`docker/worker`, `docker/coordinator`, `docker/loadgen`), each a
+`golang:1.20-bookworm` build stage producing a static (`CGO_ENABLED=0`) binary copied
+into a `gcr.io/distroless/static-debian12:nonroot` runtime stage -- no shell, no
+package manager, non-root by construction. None needs `protoc`: the generated
+protobuf sources under `proto/` are checked in. See `docker/README.md`.
+
+### Kubernetes topology
+
+```
+                         +-------------------+
+  clients / loadgen ---> |  worker Service    | --(load-balanced)--> 3x worker pod
+                         +-------------------+                        |  |  |
+                                                                       v  v  v
+                                                              +--------------------+
+                                                              | coordinator Service|
+                                                              +--------------------+
+                                                                         |
+                                                              +--------------------+
+                                                              | coordinator pod (x1)|
+                                                              +--------------------+
+                                                                         |
+                                                              shared MongoDB (external;
+                                                              not deployed by this repo)
+```
+
+Workers: `replicas: 3`, ordinary `RollingUpdate` (the Kubernetes default) is fine,
+because correctness under concurrent replicas comes entirely from the shared
+coordinator's strict 2PL and fencing, not from anything workers coordinate among
+themselves.
+
+Coordinator: `replicas: 1`, and -- unlike the default -- `strategy: Recreate`,
+**never** `RollingUpdate`. Two coordinator pods running at once would each hold an
+independent in-memory lock table, silently splitting coordination between workers
+with no error to signal it. `Recreate` tears the old pod down before the new one
+starts, so every coordinator rollout has a brief real coordination outage. That is
+the deliberate trade: deployment availability for coordination safety. This is not
+high availability, and Phase 4 adds no leader election or consensus to make it one --
+the single coordinator remains the same explicit failure domain Phase 3A through 3C
+already documented, just now with an honest rollout policy instead of a rolling
+update that would make the failure mode worse.
+
+Configuration: a `ConfigMap` for non-sensitive settings (coordinator address,
+database name, timeout settings) and a `Secret` for MongoDB credentials. The
+checked-in `secret.yaml` is a local/dev placeholder, deliberately excluded from
+`kustomization.yaml`; `deploy/kubernetes/README.md` documents creating the real one
+out-of-band. CPU/memory requests and limits are explicit but conservative
+development defaults, not derived from any benchmark -- `cmd/loadgen` is
+functional/correctness tooling at this phase, not a sizing tool.
+
+Network isolation: a `default-deny-ingress` NetworkPolicy plus two scoped allows, so
+the coordinator is reachable only from worker pods and workers only from within the
+namespace. This restricts *which pods* can reach these services at the network
+layer; it does not add the cryptographic service authentication the coordinator's
+gRPC transport still lacks (unchanged from Phase 3A -- see "Cross-process
+coordination" above). Building mTLS or any other service-authentication layer is out
+of scope for this phase. An optional, unapplied NetworkPolicy template covers the
+case where MongoDB itself runs as an in-cluster pod; this repository does not deploy
+MongoDB at all (it is a managed/external dependency, the same way CI runs it from the
+upstream `mongo:7` image rather than a custom build).
+
+### Load generator
+
+`cmd/loadgen` talks to the worker Service over gRPC -- never the client package
+directly -- so it exercises the same load-balanced boundary a real caller would.
+Four workloads: independent-file writes, same-file writes (the one that actually
+exercises cross-replica strict 2PL, since concurrent callers may land on different
+worker pods and correctness depends entirely on the shared coordinator, not on
+anything workers share in-process), reads, and a mixed interleaving. It is
+functional/correctness tooling for this phase, deliberately not a tuned
+throughput/latency benchmark -- that comes later, once observability exists.
+
+### Evidence
+
+| Check | How |
+| --- | --- |
+| Coordinator fails closed | `cmd/coordinator`'s `openFenceStore` unit-tested directly (no MongoDB configured, and MongoDB configured but unreachable); also verified against the actual built Docker image, which exits non-zero with no `SAFER_MONGO_URI` (now a CI job: `.github/workflows/ci.yml`'s `docker`) |
+| Worker refuses bad/missing config | `cmd/worker`'s `parseConfig` unit-tested: missing MongoDB, missing coordinator, missing both, non-positive timeouts |
+| Multiple worker replicas serve one deployment correctly | `integration/workerservice`: real worker and coordinator processes, `InitUser` on one replica, `StoreFile`/`AppendToFile`/`LoadFile` on others, for two independent users, against one MongoDB |
+| Readiness/liveness semantics | `integration/workerservice`: a live worker reports `SERVING` on both the default (readiness) and `"liveness"` gRPC health services |
+| Load generator drives the worker Service | `integration/workerservice`: all four workload types run against two real worker replicas with zero errors; also run manually against Docker containers (see `docker/README.md`) |
+| Docker images build and interoperate | All three images built and smoke-tested together on a Docker network against a real MongoDB replica set (`docker/README.md`); now also built (not run) on every CI push (`.github/workflows/ci.yml`'s `docker` job) |
+| Kubernetes manifests are internally consistent | `deploy/kubernetes/manifest_test.go`: `kubectl kustomize` builds the full manifest set and the files intentionally excluded from it, catching a broken cross-reference (e.g. a Service selector that stops matching a Deployment's labels) |
+| Existing Phase 1-3C correctness | Full suite (`go test ./...`, with and without `SAFER_MONGO_URI`) re-run clean after every Phase 4 change, including `integration/crossprocess` and `integration/rollback_test.go` |
+
+**Not evidence of a live Kubernetes deployment.** No Kubernetes cluster was available
+in the environment this phase was built in (no `kind`/`minikube`, no Docker Desktop
+Kubernetes context -- `kubectl cluster-info` fails to connect). The manifests are
+statically validated, not applied: no pod has actually been scheduled, no probe has
+actually fired against a kubelet, no NetworkPolicy has actually been enforced by a
+CNI plugin, and the coordinator's `Recreate` rollout has not been observed in a live
+rollout. See `deploy/kubernetes/README.md` for the precise boundary between what ran
+and what was only reviewed.
+
 ## Claims not yet earned
 
 Recorded here so they are not asserted prematurely:
@@ -417,3 +574,23 @@ Recorded here so they are not asserted prematurely:
   tests meaningful yet. That is Phase 3C.
 - The checked-in benchmark tables are inherited historical SAFER-CC measurements, not
   performance claims about this repository.
+- **No live Kubernetes verification.** Phase 4's manifests are statically validated
+  (`kubectl kustomize` builds cleanly, cross-references checked by
+  `deploy/kubernetes/manifest_test.go`) but were never applied to a running cluster --
+  none was available in the environment they were built in. No pod has actually been
+  scheduled, no readiness/liveness probe has actually fired against a kubelet, no
+  NetworkPolicy has actually been enforced by a CNI plugin, and the coordinator's
+  `Recreate` rollout has not been observed in a live rollout. What WAS run end-to-end:
+  all three Docker images together on a plain Docker network against real MongoDB
+  (`docker/README.md`), and the equivalent multi-process topology through Go
+  integration tests (`integration/workerservice`).
+- **No cryptographic service authentication.** The coordinator's gRPC transport is
+  still unauthenticated at the application layer, unchanged from Phase 3A. Phase 4's
+  NetworkPolicies restrict *which pods* can reach the coordinator and workers at the
+  network layer; they do not authenticate *what* an already-allowed pod sends. Building
+  mTLS or another service-authentication layer is explicitly out of scope for this
+  phase.
+- **No production sizing.** The CPU/memory requests and limits in
+  `deploy/kubernetes/` are conservative development defaults, not derived from any
+  load test. `cmd/loadgen` validates functional correctness under concurrency in this
+  phase, not throughput or capacity.

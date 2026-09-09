@@ -116,3 +116,33 @@ jobs:
       - name: MongoDB logs on failure
         if: failure()
         run: docker logs safer-mongo
+
+  docker:
+    name: Docker images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Build-only, no push: this job exists to catch a broken Dockerfile
+      # or a build that silently stops being reproducible (see
+      # docker/README.md for what "reproducible" means here -- no protoc
+      # needed since generated proto sources are checked in), not to
+      # publish images anywhere.
+      - name: Build worker image
+        run: docker build -f docker/worker/Dockerfile -t safer-worker:ci .
+      - name: Build coordinator image
+        run: docker build -f docker/coordinator/Dockerfile -t safer-coordinator:ci .
+      - name: Build loadgen image
+        run: docker build -f docker/loadgen/Dockerfile -t safer-loadgen:ci .
+      # Confirms the coordinator's Phase 4.0 fail-closed policy holds
+      # inside the actual built image, not just in the Go test suite:
+      # started with no SAFER_MONGO_URI, it must exit non-zero rather
+      # than serving unfenced.
+      - name: Verify the coordinator image fails closed without MongoDB
+        run: |
+          if docker run --rm safer-coordinator:ci; then
+            echo "coordinator started with no SAFER_MONGO_URI configured; it must fail closed"
+            exit 1
+          fi
