@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+// Package worker.v1 is the wire surface of the SAFER worker service
+// (cmd/worker).
+//
+// The worker is a stateless adapter around the existing SAFER client
+// package (github.com/JamJamzzz/safer-distributed/client): every RPC opens
+// or reuses this process's MongoDB and coordinator connections and calls
+// straight into the same InitUser/StoreFile/AppendToFile/LoadFile logic
+// SAFER-CC has always had. No new cryptography, storage, or locking
+// semantics are introduced here.
+//
+// The surface is intentionally the minimum needed to drive a realistic
+// deployment/load test, not a mechanical export of every SAFER method.
+//
+// Every RPC carries the caller's username and password: SAFER derives a
+// user's keys from that pair on every call rather than keeping
+// server-side session state (see client.GetUser), so the worker itself
+// holds no per-user state between requests and any replica can serve any
+// request.
+package worker.v1;
+
+option go_package = "github.com/JamJamzzz/safer-distributed/proto/worker/v1;workerv1";
+
+message InitUserRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message InitUserResponse {}
+
+message StoreFileRequest {
+  string username = 1;
+  string password = 2;
+  string filename = 3;
+  bytes content = 4;
+}
+
+message StoreFileResponse {}
+
+message AppendToFileRequest {
+  string username = 1;
+  string password = 2;
+  string filename = 3;
+  bytes content = 4;
+}
+
+message AppendToFileResponse {}
+
+message LoadFileRequest {
+  string username = 1;
+  string password = 2;
+  string filename = 3;
+}
+
+message LoadFileResponse {
+  bytes content = 1;
+}
+
+// SaferWorker exposes enough of the SAFER client API to drive a realistic
+// deployment and load test. It is deliberately not a full export of every
+// SAFER operation.
+service SaferWorker {
+  rpc InitUser(InitUserRequest) returns (InitUserResponse);
+  rpc StoreFile(StoreFileRequest) returns (StoreFileResponse);
+  rpc AppendToFile(AppendToFileRequest) returns (AppendToFileResponse);
+  rpc LoadFile(LoadFileRequest) returns (LoadFileResponse);
+}
