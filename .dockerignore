@@ -1,0 +1,9 @@
+.git
+.github
+docs
+deploy
+benchmarks
+review.md
+CHANGELOG.md
+README.md
+*.md
