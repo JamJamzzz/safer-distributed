@@ -247,7 +247,7 @@ func runOne(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, 
 // bytes never actually landed, or that a concurrent write clobbered --
 // changes the file's length and is caught here. This is the one point in
 // the tool that asks "is the data really there", instead of only "did the
-// RPC return an error"; nothing about a clean error count from run()
+// RPC return an error"; nothing about a clean error count from runWorkload
 // implies the data is correct without this also passing.
 //
 // WorkloadReads needs no separate check here: runOne already verifies
@@ -300,13 +300,13 @@ func checkOracles(ctx context.Context, cfg Config, client workerv1.SaferWorkerCl
 	return dataFailures, verificationErrors
 }
 
-// run executes cfg's workload against conn and returns a Report.
+// runWorkload executes cfg's workload against conn and returns a Report.
 //
 // Work is divided by a shared atomic counter, not by giving each goroutine
 // a fixed slice of Count: a caller stalled behind another's exclusive lock
 // (WorkloadSameFileWrites, by design) should not leave its share of the
 // work undone while idle goroutines have nothing left to do.
-func run(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report, error) {
+func runWorkload(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report, error) {
 	client := workerv1.NewSaferWorkerClient(conn)
 	tally := newReplicaTally()
 

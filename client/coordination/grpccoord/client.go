@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -117,6 +118,16 @@ func Dial(ctx context.Context, cfg Config) (*Backend, error) {
 	conn, err := grpc.DialContext(dialCtx, cfg.Address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
+		// otelgrpc's client stats handler creates a span for every
+		// outgoing Acquire/RenewLease/EndTransaction/Health call and
+		// injects the current trace context (from whatever context.Context
+		// the caller's *Context SAFER operation is threading -- see
+		// client.StoreFileContext and friends) into the RPC's metadata, so
+		// the coordinator's own server-side span (cmd/coordinator's
+		// otelgrpc.NewServerHandler) becomes a child of it rather than the
+		// root of a new trace. Unconditional and safe with no telemetry
+		// backend configured; see internal/telemetry's package doc.
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("grpccoord: dial %s: %w", cfg.Address, err)

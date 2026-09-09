@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/resolver"
@@ -73,6 +74,15 @@ func dialTarget(ctx context.Context, addresses []string) (*grpc.ClientConn, erro
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultServiceConfig(roundRobinServiceConfig),
 		grpc.WithBlock(),
+		// otelgrpc's client stats handler starts the trace for every
+		// request this tool makes -- loadgen is the first hop, so this is
+		// where each distributed trace (loadgen -> worker -> coordinator)
+		// actually begins -- and injects that trace context into the RPC,
+		// for the worker's own server-side span (cmd/worker's
+		// otelgrpc.NewServerHandler) to continue as a child. Unconditional
+		// and safe with no telemetry backend configured; see
+		// internal/telemetry's package doc.
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	}
 
 	if len(addresses) == 1 {

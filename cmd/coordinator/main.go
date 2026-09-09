@@ -30,6 +30,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -37,6 +38,7 @@ import (
 	"github.com/JamJamzzz/safer-distributed/client/coordination/grpccoord"
 	"github.com/JamJamzzz/safer-distributed/client/fencing/mongofence"
 	"github.com/JamJamzzz/safer-distributed/client/storage/mongostore"
+	"github.com/JamJamzzz/safer-distributed/internal/telemetry"
 	coordinatorv1 "github.com/JamJamzzz/safer-distributed/proto/coordinator/v1"
 )
 
@@ -52,6 +54,23 @@ func main() {
 
 // run starts the coordinator and serves until it is asked to stop.
 func run(cfg Config) error {
+	// Telemetry is optional (see internal/telemetry's package doc): with
+	// no OTEL_EXPORTER_OTLP_* endpoint configured, Setup does nothing and
+	// shutdownTelemetry is a no-op, so a coordinator with no observability
+	// backend configured behaves exactly as it did before Phase 5.
+	// Registered before the other deferred cleanups below, so it runs
+	// last -- flushing whatever telemetry the run produced only after
+	// everything else has already shut down.
+	shutdownTelemetry, err := telemetry.Setup(context.Background(), telemetry.Config{ServiceName: "safer-coordinator"})
+	if err != nil {
+		return fmt.Errorf("telemetry setup: %w", err)
+	}
+	defer func() {
+		if err := shutdownTelemetry(context.Background()); err != nil {
+			log.Printf("coordinator: flushing telemetry: %v", err)
+		}
+	}()
+
 	fences, closeFences, err := openFenceStore(cfg)
 	if err != nil {
 		return err
@@ -74,7 +93,15 @@ func run(cfg Config) error {
 	coordinator := grpccoord.NewServerWithConfig(serverConfig)
 	defer coordinator.Stop()
 
-	server := grpc.NewServer()
+	// otelgrpc's server stats handler creates one span per incoming RPC
+	// (Acquire, RenewLease, EndTransaction, Health) and, when a caller
+	// propagated trace context (a worker's outgoing Acquire call --
+	// see grpccoord.Dial), makes this span a child of that caller's
+	// span rather than the root of a new trace. It is unconditional and
+	// safe with no telemetry backend configured (see internal/telemetry's
+	// package doc): the handler then just talks to OpenTelemetry's own
+	// no-op tracer.
+	server := grpc.NewServer(grpc.StatsHandler(otelgrpc.NewServerHandler()))
 	coordinatorv1.RegisterLockCoordinatorServer(server, coordinator)
 
 	// The gRPC health-checking protocol, for Kubernetes' native grpc

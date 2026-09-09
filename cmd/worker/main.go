@@ -45,6 +45,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -52,6 +53,7 @@ import (
 	"github.com/JamJamzzz/safer-distributed/client"
 	"github.com/JamJamzzz/safer-distributed/client/coordination/grpccoord"
 	"github.com/JamJamzzz/safer-distributed/client/storage/mongostore"
+	"github.com/JamJamzzz/safer-distributed/internal/telemetry"
 	workerv1 "github.com/JamJamzzz/safer-distributed/proto/worker/v1"
 )
 
@@ -73,6 +75,21 @@ func main() {
 // fails at startup rather than accepting traffic it cannot actually serve.
 func run(cfg Config) error {
 	ctx := context.Background()
+
+	// Telemetry is optional (see internal/telemetry's package doc): with
+	// no OTEL_EXPORTER_OTLP_* endpoint configured, Setup does nothing and
+	// shutdownTelemetry is a no-op. Registered before the other deferred
+	// cleanups below, so it runs last -- flushing whatever telemetry the
+	// run produced only after everything else has already shut down.
+	shutdownTelemetry, err := telemetry.Setup(ctx, telemetry.Config{ServiceName: "safer-worker"})
+	if err != nil {
+		return fmt.Errorf("telemetry setup: %w", err)
+	}
+	defer func() {
+		if err := shutdownTelemetry(context.Background()); err != nil {
+			log.Printf("worker: flushing telemetry: %v", err)
+		}
+	}()
 
 	store, err := mongostore.Open(ctx, cfg.Mongo)
 	if err != nil {
@@ -108,7 +125,18 @@ func run(cfg Config) error {
 	// it lets a caller observe which replica served a request, which is
 	// what makes claims about cross-replica load balancing (see dial.go
 	// and cmd/loadgen) checkable instead of asserted.
-	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(instanceHeaderInterceptor(instanceID())))
+	//
+	// otelgrpc's server stats handler creates one span per incoming
+	// worker.v1.SaferWorker RPC and, when the caller (cmd/loadgen)
+	// propagated trace context, makes this span a child of the caller's
+	// rather than the root of a new trace. It composes independently of
+	// the interceptor above -- StatsHandler and ChainUnaryInterceptor are
+	// separate grpc.ServerOptions -- and is unconditional and safe with no
+	// telemetry backend configured; see internal/telemetry's package doc.
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(instanceHeaderInterceptor(instanceID())),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+	)
 	workerv1.RegisterSaferWorkerServer(grpcServer, &saferWorkerServer{
 		authLimiter: newAuthLimiter(cfg.AuthConcurrency),
 	})
