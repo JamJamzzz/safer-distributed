@@ -15,10 +15,13 @@ package main
 // concurrent load settled at roughly 150-165 MB of resident memory after
 // any burst of this work (Go's allocator does not hand pages back to the
 // OS quickly, so that level persists between bursts rather than an
-// isolated spike), and two or more of these sections genuinely
-// overlapping in one process pushed it well past a 256Mi container
-// limit, reproducibly, without approaching that limit ever climbing
-// further across repeated runs -- i.e. concurrency pressure, not a leak.
+// isolated spike). Measured at controlled loadgen concurrency levels
+// against the same worker process: 2 overlapping sections reached
+// ~217 MB observed, with no OOM at that level in the measured run; 4 or
+// more overlapping sections reliably exceeded the original 256Mi
+// container limit and were OOMKilled. Repeating low-concurrency runs
+// found that level stable rather than climbing further run over run --
+// i.e. concurrency pressure, not a leak.
 //
 // The fix is not "give the container more memory and hope": an
 // unbounded number of concurrent authentications in one process has no

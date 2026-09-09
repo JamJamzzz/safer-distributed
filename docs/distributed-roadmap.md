@@ -644,7 +644,11 @@ doc). `userlib.Argon2Key` calls `golang.org/x/crypto/argon2.IDKey` with a memory
 parameter of `64*1024` KiB (64 MiB) per call -- a fixed, deliberate cost of the
 memory-hard KDF the SAFER-CC crypto layer already used, not a bug and not something
 this phase weakens. `InitUser` separately performs RSA/DS key generation, its own
-expensive crypto.
+expensive crypto -- also bounded by the same admission control introduced below,
+since it is comparably costly, but it is **not** what this incident's measured
+concurrent load exercised: the measurements in this section drove
+`StoreFile`/`AppendToFile`/`LoadFile` traffic (`workload=mixed`), which authenticates
+through `GetUserContext`/Argon2, not through `InitUser`.
 
 Measuring a real worker process under `crictl stats` at controlled `-concurrency`
 levels (1/2/4/8, same `workload=mixed`/`count=200` shape as the checked-in Job)
@@ -686,13 +690,15 @@ be hit soon. `cmd/worker/authlimit.go` adds `authLimiter`, a small context-aware
 semaphore bounding how many of those two calls may run at once in one worker process
 (`-auth-concurrency`, default `DefaultAuthConcurrency = 2`, chosen directly from the
 measurements above: it permits real concurrency while keeping a worker's expected
-peak, roughly two overlapping ~160-220 MB sections, inside the revised memory limit).
-It wraps only the expensive section -- lock acquisition and the MongoDB transaction
-that follow authentication are not gated -- and changes no SAFER semantics: no
-server-side session, no cached password or derived key, no weakened Argon2
-parameters, and `GetUserContext`'s authentication itself is never bypassed. `InitUser`
-uses the identical limiter, since its key generation is exactly the same class of
-cost. `cmd/worker/authlimit_test.go` and `cmd/worker/authenticate`'s tests prove,
+peak -- the observed ~217 MB total for 2 overlapping `GetUserContext` calls, not an
+OOM in the measured run -- inside the revised memory limit). It wraps only the
+expensive section -- lock acquisition and the MongoDB transaction that follow
+authentication are not gated -- and changes no SAFER semantics: no server-side
+session, no cached password or derived key, no weakened Argon2 parameters, and
+`GetUserContext`'s authentication itself is never bypassed. `InitUser` uses the
+identical limiter, since its key generation is the same class of cost, even though
+it was not what this incident's own measured load exercised (see above).
+`cmd/worker/authlimit_test.go` and `cmd/worker/authenticate`'s tests prove,
 deterministically: at most N sections run concurrently; a waiter whose context is
 cancelled while queued for a slot returns promptly without taking one; a failed
 authentication still releases its slot (checked with a limiter of size 1, where a

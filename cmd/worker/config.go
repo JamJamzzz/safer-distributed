@@ -13,14 +13,19 @@ import (
 //
 // DefaultAuthConcurrency is evidence-derived, not a guess (Phase 4.6; see
 // docs/distributed-roadmap.md's Phase 4.6 section for the full
-// measurement). A live worker process, under real load, settled at
-// roughly 150-165 MB of resident memory after any burst of concurrent
-// GetUserContext/InitUserContext calls (each performs an Argon2 key
-// derivation or RSA/DS key generation), and two such calls genuinely
-// overlapping pushed a single process to as much as ~217 MB observed,
-// with four overlapping reliably exceeding 256 MB and triggering an
-// OOM kill. 2 admits real concurrency while keeping one worker's expected
-// peak (roughly 2 x 160-220 MB) inside deploy/kubernetes/worker-
+// measurement). The measured incident's cause was concurrent
+// GetUserContext calls -- every ordinary StoreFile/AppendToFile/LoadFile
+// RPC re-authenticating via Argon2 key derivation -- during a timed
+// loadgen workload. A live worker process, under that load, settled at
+// roughly 150-165 MB of resident memory after any burst of this work,
+// and 2 overlapping GetUserContext calls reached as much as ~217 MB
+// observed TOTAL for the process, with no OOM at that level in the
+// measured run; 4 or more overlapping calls reliably exceeded the
+// original 256Mi container limit and were OOMKilled. InitUser's RSA/DS
+// key generation is comparably expensive and is bounded by this same
+// limiter, but it was not what the measured incident's concurrent load
+// exercised. 2 admits real concurrency while keeping one worker's
+// expected peak (the observed ~217 MB) inside deploy/kubernetes/worker-
 // deployment.yaml's memory limit, which was raised to match (see that
 // file's own comment).
 const (
