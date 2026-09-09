@@ -1,5 +1,17 @@
-# One Service load-balancing across the 3 worker replicas. This is what
-# cmd/loadgen (and any real client) points at -- never an individual pod.
+# A normal ClusterIP Service in front of the worker replicas.
+#
+# This gives every worker replica one stable virtual IP and DNS name, but
+# it does NOT spread a gRPC client's traffic across replicas by itself:
+# kube-proxy assigns one backend pod per TCP connection, and a gRPC client
+# multiplexes every RPC over one long-lived HTTP/2 connection, so a client
+# that dials this Service once talks to exactly one pod for the life of
+# that connection, no matter how many replicas exist. That is fine for a
+# short-lived or one-off call (or a plain TCP health check), but it is NOT
+# what cmd/loadgen (or any client that wants real cross-replica balancing)
+# should point at -- see worker-service-headless.yaml and
+# cmd/loadgen/dial.go for the actual mechanism, and this repository's own
+# Phase 4.5 history for the overclaim this file's comment used to make
+# before that gap was noticed.
 apiVersion: v1
 kind: Service
 metadata:

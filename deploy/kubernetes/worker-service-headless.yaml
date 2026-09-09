@@ -1,0 +1,30 @@
+# A HEADLESS Service (clusterIP: None) over the same worker pods as
+# worker-service.yaml. This is what a client that wants real per-RPC
+# balancing across replicas should point at, not the ClusterIP Service.
+#
+# The difference is what DNS returns. Resolving a normal ClusterIP
+# Service's name returns exactly one IP -- the Service's own virtual IP --
+# and kube-proxy hides the pod fan-out behind it. Resolving THIS Service's
+# name returns the individual IP of every ready pod behind it directly,
+# because there is no virtual IP to hide them behind. cmd/loadgen dials it
+# as a "dns:///" target (see cmd/loadgen/dial.go): gRPC's DNS resolver
+# fetches that full address list, keeps one connection open to each pod,
+# and its round_robin balancer picks a different one per RPC. Kubernetes'
+# Service networking is not doing the balancing in this path at all --
+# gRPC is, using DNS only to learn the pod addresses -- which is exactly
+# why a headless Service is required and a ClusterIP one is not enough.
+apiVersion: v1
+kind: Service
+metadata:
+  name: safer-worker-headless
+  namespace: safer-distributed
+  labels:
+    app: safer-worker
+spec:
+  clusterIP: None
+  selector:
+    app: safer-worker
+  ports:
+    - name: grpc
+      port: 50052
+      targetPort: grpc

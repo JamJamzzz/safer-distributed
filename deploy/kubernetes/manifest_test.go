@@ -54,6 +54,12 @@ func TestKustomizationBuilds(t *testing.T) {
 		"type: Recreate",
 		"replicas: 1",
 		"replicas: 3",
+		// The headless Service (Phase 4.5) is what makes real cross-pod
+		// gRPC balancing possible at all -- see worker-service-headless.yaml
+		// and cmd/loadgen/dial.go. Losing "clusterIP: None" silently turns
+		// it back into an ordinary Service that resolves to one IP.
+		"name: safer-worker-headless",
+		"clusterIP: None",
 	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("kustomize output does not contain %q", want)

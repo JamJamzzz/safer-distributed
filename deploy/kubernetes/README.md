@@ -60,6 +60,31 @@ Kubernetes toggle, or similar), running the Apply steps above and then
 these manifests is expected to need cluster-specific changes beyond
 pointing at wherever MongoDB actually lives.
 
+## Load balancing across worker replicas
+
+`loadgen-job.yaml` targets `dns:///safer-worker-headless:50052`, not the
+plain `safer-worker` ClusterIP Service. That is not a stylistic choice: a
+gRPC client that dials a ClusterIP Service once (as any long-lived client,
+including a naive load generator, naturally would) gets one HTTP/2
+connection that kube-proxy has pinned to one backend pod, and every RPC
+multiplexed over it lands on that same pod regardless of how many replicas
+exist. `worker-service-headless.yaml` (`clusterIP: None`) is what makes
+DNS resolution return every ready pod's own IP instead of one virtual IP;
+`cmd/loadgen/dial.go` is what turns that address list into real per-RPC
+`round_robin` balancing, client-side. See that file's package doc and
+`worker-service.yaml`'s own header comment for the full explanation.
+
+This was verified without a Kubernetes cluster by reproducing the same DNS
+shape with plain Docker: three worker containers sharing one
+`--network-alias`, which makes Docker's embedded DNS return all three
+containers' IPs for that one name -- functionally identical, for gRPC's
+purposes, to a Kubernetes headless Service. `docker/README.md` has the
+exact commands and output: `replicas_served=3`, read from the response-
+header instance identifier `cmd/worker` attaches to every RPC
+(`internal/workerdiag`), not assumed. That is the check to repeat against
+this Job's actual output once a real cluster is available -- see "What was
+and was not actually run" above for why it has not been yet.
+
 ## Health semantics
 
 See the inline comments in `worker-deployment.yaml` and

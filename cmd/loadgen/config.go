@@ -41,11 +41,14 @@ func (w Workload) valid() bool {
 
 // Config describes one load-generation run.
 type Config struct {
-	// Addresses are one or more worker Service addresses to dial. Real
-	// deployments pass one address -- the Kubernetes Service DNS name,
-	// which Kubernetes itself load-balances across worker replica pods.
-	// More than one is accepted so this tool is also useful for local
-	// testing without a Service in front of anything.
+	// Addresses is one or more targets to dial (see dial.go for how each
+	// shape is handled). Real deployments pass exactly one: a "dns:///"
+	// target naming the worker HEADLESS Service, so gRPC's own DNS
+	// resolver and round_robin balancer spread RPCs across every ready
+	// worker pod from this one connection -- a plain ClusterIP Service
+	// address would not do this; see dial.go's package doc for why. More
+	// than one address is accepted for local testing against literal
+	// process addresses with no DNS name unifying them.
 	Addresses []string
 
 	Concurrency int
@@ -64,7 +67,9 @@ type Config struct {
 func parseConfig(args []string) (Config, error) {
 	fs := flag.NewFlagSet("loadgen", flag.ContinueOnError)
 	addr := fs.String("addr", "",
-		"comma-separated worker Service address(es) to dial, e.g. safer-worker:50052")
+		"comma-separated target(s) to dial, e.g. dns:///safer-worker-headless:50052 "+
+			"(one dns:/// target against a headless Service, for real cross-pod balancing) "+
+			"or 127.0.0.1:50052,127.0.0.1:50053 (literal addresses, for local testing)")
 	concurrency := fs.Int("concurrency", 10, "number of concurrent callers")
 	count := fs.Int("count", 100,
 		"total number of operations to run across all callers; ignored if -duration is positive")

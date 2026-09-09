@@ -91,7 +91,11 @@ func run(cfg Config) error {
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
 	}
 
-	grpcServer := grpc.NewServer()
+	// The instance-header interceptor is diagnostic only (see instance.go):
+	// it lets a caller observe which replica served a request, which is
+	// what makes claims about cross-replica load balancing (see dial.go
+	// and cmd/loadgen) checkable instead of asserted.
+	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(instanceHeaderInterceptor(instanceID())))
 	workerv1.RegisterSaferWorkerServer(grpcServer, &saferWorkerServer{})
 
 	healthServer := health.NewServer()

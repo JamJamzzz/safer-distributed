@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
+	"github.com/JamJamzzz/safer-distributed/internal/workerdiag"
 	workerv1 "github.com/JamJamzzz/safer-distributed/proto/worker/v1"
 )
 
@@ -28,12 +30,21 @@ type Report struct {
 	Errors      int64
 	Elapsed     time.Duration
 	FirstErrors []string // up to a handful of distinct error messages, for diagnosis
+
+	// Replicas counts completed RPCs by the worker instance that served
+	// them (see internal/workerdiag and cmd/worker/instance.go), keyed by
+	// hostname-pid. This is the evidence for whatever balancing claim the
+	// caller made when choosing -addr: more than one key here means more
+	// than one worker process actually served this run, not just that
+	// more than one address was configured.
+	Replicas map[string]int64
 }
 
 func (r Report) String() string {
 	rate := float64(r.Completed) / r.Elapsed.Seconds()
 	s := fmt.Sprintf("workload=%s completed=%d errors=%d elapsed=%s throughput=%.1f ops/s",
 		r.Workload, r.Completed, r.Errors, r.Elapsed.Round(time.Millisecond), rate)
+	s += fmt.Sprintf("\nreplicas_served=%d %v", len(r.Replicas), r.Replicas)
 	for _, e := range r.FirstErrors {
 		s += fmt.Sprintf("\n  error: %s", e)
 	}
@@ -47,34 +58,44 @@ type user struct {
 	filename string
 }
 
-// connPicker round-robins across the dialed worker addresses. A real
-// deployment passes one address (the Kubernetes Service, which Kubernetes
-// itself load-balances); this exists so the same tool is useful for local
-// testing without a Service in front of anything, and so a single loadgen
-// process is not pinned to one worker replica by construction.
-type connPicker struct {
-	clients []workerv1.SaferWorkerClient
-	next    uint64
+// replicaTally counts, per worker instance, how many RPCs it actually
+// served -- read from the response header cmd/worker's
+// instanceHeaderInterceptor attaches to every call, never assumed from
+// how many addresses were dialed.
+type replicaTally struct {
+	mu     sync.Mutex
+	counts map[string]int64
 }
 
-func newConnPicker(conns []*grpc.ClientConn) *connPicker {
-	clients := make([]workerv1.SaferWorkerClient, len(conns))
-	for i, c := range conns {
-		clients[i] = workerv1.NewSaferWorkerClient(c)
+func newReplicaTally() *replicaTally {
+	return &replicaTally{counts: make(map[string]int64)}
+}
+
+func (rt *replicaTally) record(header metadata.MD) {
+	ids := header.Get(workerdiag.InstanceHeaderKey)
+	if len(ids) == 0 {
+		return
 	}
-	return &connPicker{clients: clients}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.counts[ids[0]]++
 }
 
-func (p *connPicker) pick() workerv1.SaferWorkerClient {
-	i := atomic.AddUint64(&p.next, 1) - 1
-	return p.clients[i%uint64(len(p.clients))]
+func (rt *replicaTally) snapshot() map[string]int64 {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	out := make(map[string]int64, len(rt.counts))
+	for k, v := range rt.counts {
+		out[k] = v
+	}
+	return out
 }
 
 // setup prepares the users and initial file content a workload needs
 // before the timed run starts, so setup latency (InitUser is intentionally
 // expensive -- see client.InitUser -- and StoreFile is a full multi-object
 // mutation) is never counted as load.
-func setup(ctx context.Context, cfg Config, picker *connPicker) ([]user, error) {
+func setup(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, tally *replicaTally) ([]user, error) {
 	users := make([]user, cfg.Users)
 	initialContent := make([]byte, cfg.ContentSize)
 
@@ -84,19 +105,23 @@ func setup(ctx context.Context, cfg Config, picker *connPicker) ([]user, error) 
 			password: fmt.Sprintf("password-%d", i),
 			filename: "loadgen.dat",
 		}
-		if _, err := picker.pick().InitUser(ctx, &workerv1.InitUserRequest{
+		var header metadata.MD
+		if _, err := client.InitUser(ctx, &workerv1.InitUserRequest{
 			Username: u.username, Password: u.password,
-		}); err != nil {
+		}, grpc.Header(&header)); err != nil {
 			return nil, fmt.Errorf("setup: InitUser %d: %w", i, err)
 		}
+		tally.record(header)
 
 		switch cfg.Workload {
 		case WorkloadSameFileWrites, WorkloadReads, WorkloadMixed, WorkloadIndependentWrites:
-			if _, err := picker.pick().StoreFile(ctx, &workerv1.StoreFileRequest{
+			header = nil
+			if _, err := client.StoreFile(ctx, &workerv1.StoreFileRequest{
 				Username: u.username, Password: u.password, Filename: u.filename, Content: initialContent,
-			}); err != nil {
+			}, grpc.Header(&header)); err != nil {
 				return nil, fmt.Errorf("setup: StoreFile %d: %w", i, err)
 			}
+			tally.record(header)
 		}
 		users[i] = u
 	}
@@ -113,45 +138,50 @@ func callerUser(users []user, callerIndex int) user {
 }
 
 // runOne performs a single operation for the given caller against its
-// user, per the workload's definition, and reports whether it succeeded.
-func runOne(ctx context.Context, cfg Config, picker *connPicker, u user, content []byte) error {
-	client := picker.pick()
+// user, per the workload's definition, records which replica served it,
+// and reports whether it succeeded.
+func runOne(ctx context.Context, cfg Config, client workerv1.SaferWorkerClient, tally *replicaTally, u user, content []byte) error {
+	var header metadata.MD
+	var err error
 
 	switch cfg.Workload {
 	case WorkloadIndependentWrites, WorkloadSameFileWrites:
-		_, err := client.AppendToFile(ctx, &workerv1.AppendToFileRequest{
+		_, err = client.AppendToFile(ctx, &workerv1.AppendToFileRequest{
 			Username: u.username, Password: u.password, Filename: u.filename, Content: content,
-		})
-		return err
+		}, grpc.Header(&header))
 	case WorkloadReads:
-		_, err := client.LoadFile(ctx, &workerv1.LoadFileRequest{
+		_, err = client.LoadFile(ctx, &workerv1.LoadFileRequest{
 			Username: u.username, Password: u.password, Filename: u.filename,
-		})
-		return err
+		}, grpc.Header(&header))
 	case WorkloadMixed:
 		if rand.Intn(2) == 0 {
-			_, err := client.AppendToFile(ctx, &workerv1.AppendToFileRequest{
+			_, err = client.AppendToFile(ctx, &workerv1.AppendToFileRequest{
 				Username: u.username, Password: u.password, Filename: u.filename, Content: content,
-			})
-			return err
+			}, grpc.Header(&header))
+		} else {
+			_, err = client.LoadFile(ctx, &workerv1.LoadFileRequest{
+				Username: u.username, Password: u.password, Filename: u.filename,
+			}, grpc.Header(&header))
 		}
-		_, err := client.LoadFile(ctx, &workerv1.LoadFileRequest{
-			Username: u.username, Password: u.password, Filename: u.filename,
-		})
-		return err
 	default:
 		return fmt.Errorf("loadgen: unknown workload %q", cfg.Workload)
 	}
+
+	tally.record(header)
+	return err
 }
 
-// run executes cfg's workload against picker and returns a Report.
+// run executes cfg's workload against conn and returns a Report.
 //
 // Work is divided by a shared atomic counter, not by giving each goroutine
 // a fixed slice of Count: a caller stalled behind another's exclusive lock
 // (WorkloadSameFileWrites, by design) should not leave its share of the
 // work undone while idle goroutines have nothing left to do.
-func run(ctx context.Context, cfg Config, picker *connPicker) (Report, error) {
-	users, err := setup(ctx, cfg, picker)
+func run(ctx context.Context, cfg Config, conn *grpc.ClientConn) (Report, error) {
+	client := workerv1.NewSaferWorkerClient(conn)
+	tally := newReplicaTally()
+
+	users, err := setup(ctx, cfg, client, tally)
 	if err != nil {
 		return Report{}, err
 	}
@@ -195,7 +225,7 @@ func run(ctx context.Context, cfg Config, picker *connPicker) (Report, error) {
 				}
 
 				callCtx, cancel := context.WithTimeout(ctx, callTimeout)
-				err := runOne(callCtx, cfg, picker, u, content)
+				err := runOne(callCtx, cfg, client, tally, u, content)
 				cancel()
 
 				atomic.AddInt64(&completed, 1)
@@ -215,5 +245,6 @@ func run(ctx context.Context, cfg Config, picker *connPicker) (Report, error) {
 		Errors:      failed,
 		Elapsed:     time.Since(start),
 		FirstErrors: firstErrors,
+		Replicas:    tally.snapshot(),
 	}, nil
 }

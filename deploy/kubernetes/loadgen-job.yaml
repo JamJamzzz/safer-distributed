@@ -2,8 +2,14 @@
 # and exits (non-zero if it saw any errors -- see cmd/loadgen/main.go),
 # which is exactly a Job's shape and not a long-running service's.
 #
-# It targets the worker Service's DNS name, never a pod IP, so it is
-# exercising the same load-balanced path any real client would use.
+# It targets the worker HEADLESS Service (worker-service-headless.yaml)
+# through gRPC's "dns:///" scheme, NOT the plain ClusterIP worker Service.
+# That distinction is load-bearing, not stylistic: pointed at the ClusterIP
+# Service, this loadgen would talk to exactly one worker pod for its whole
+# run -- see worker-service-headless.yaml and cmd/loadgen/dial.go for why.
+# Check the Job's log output for a "replicas_served=" line with more than
+# one entry to confirm this actually happened, rather than assuming it did
+# because more than one worker replica exists.
 #
 #   kubectl apply -f deploy/kubernetes/loadgen-job.yaml
 #   kubectl logs -n safer-distributed job/safer-loadgen -f
@@ -23,7 +29,7 @@ spec:
           image: safer-loadgen:local
           imagePullPolicy: IfNotPresent
           args:
-            - "-addr=safer-worker:50052"
+            - "-addr=dns:///safer-worker-headless:50052"
             - "-workload=mixed"
             - "-concurrency=8"
             - "-count=200"

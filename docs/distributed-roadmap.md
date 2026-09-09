@@ -458,21 +458,33 @@ protobuf sources under `proto/` are checked in. See `docker/README.md`.
 ### Kubernetes topology
 
 ```
-                         +-------------------+
-  clients / loadgen ---> |  worker Service    | --(load-balanced)--> 3x worker pod
-                         +-------------------+                        |  |  |
-                                                                       v  v  v
-                                                              +--------------------+
-                                                              | coordinator Service|
-                                                              +--------------------+
-                                                                         |
-                                                              +--------------------+
-                                                              | coordinator pod (x1)|
-                                                              +--------------------+
-                                                                         |
-                                                              shared MongoDB (external;
-                                                              not deployed by this repo)
+                          dns:///, round_robin
+                          (gRPC client-side balancing --
+                           see "Load generator" below)
+                                    |
+                                    v
+                     +----------------------------+
+  clients / loadgen  | worker HEADLESS Service     | ---> 3x worker pod
+                ---->| (DNS returns every pod IP)  |        |  |  |
+                     +----------------------------+         v  v  v
+                                                     +--------------------+
+                                                     | coordinator Service|
+                                                     +--------------------+
+                                                                |
+                                                     +--------------------+
+                                                     | coordinator pod (x1)|
+                                                     +--------------------+
+                                                                |
+                                                     shared MongoDB (external;
+                                                     not deployed by this repo)
 ```
+
+The plain `safer-worker` ClusterIP Service (`worker-service.yaml`) still
+exists for anything that just wants a stable virtual IP -- but it resolves
+to one IP, and kube-proxy pins a client's connection to one backend pod
+for that connection's whole life, so it is not what a client wanting
+cross-replica balancing should use. See "Load generator" below and
+`deploy/kubernetes/worker-service.yaml`'s own header comment.
 
 Workers: `replicas: 3`, ordinary `RollingUpdate` (the Kubernetes default) is fine,
 because correctness under concurrent replicas comes entirely from the shared
@@ -511,14 +523,44 @@ upstream `mongo:7` image rather than a custom build).
 
 ### Load generator
 
-`cmd/loadgen` talks to the worker Service over gRPC -- never the client package
-directly -- so it exercises the same load-balanced boundary a real caller would.
-Four workloads: independent-file writes, same-file writes (the one that actually
-exercises cross-replica strict 2PL, since concurrent callers may land on different
-worker pods and correctness depends entirely on the shared coordinator, not on
-anything workers share in-process), reads, and a mixed interleaving. It is
-functional/correctness tooling for this phase, deliberately not a tuned
-throughput/latency benchmark -- that comes later, once observability exists.
+`cmd/loadgen` talks to worker addresses over gRPC -- never the client package
+directly. Four workloads: independent-file writes, same-file writes (the one
+that actually exercises cross-replica strict 2PL, since concurrent callers
+may land on different worker pods and correctness depends entirely on the
+shared coordinator, not on anything workers share in-process), reads, and a
+mixed interleaving. It is functional/correctness tooling for this phase,
+deliberately not a tuned throughput/latency benchmark -- that comes later,
+once observability exists.
+
+**Balancing across replicas is done by the gRPC client, not by Kubernetes.**
+An earlier version of this tool, and this document, asserted that pointing
+loadgen at the worker Service exercised all three replicas. That was never
+actually checked, and it does not hold: a gRPC client that dials a
+ClusterIP Service once gets one HTTP/2 connection that kube-proxy has
+pinned to whichever pod it first reached, and every RPC multiplexed over
+that one connection lands on that same pod for as long as the connection
+lives -- no matter how many replicas exist behind the Service. The fix
+(`cmd/loadgen/dial.go`) is gRPC's own `round_robin` load-balancing policy
+against a target that actually resolves to more than one address: a
+HEADLESS Service (`clusterIP: None`, `worker-service-headless.yaml`)
+makes DNS return every ready pod's IP directly instead of hiding them
+behind one virtual IP, gRPC's built-in DNS resolver (registered
+automatically, no extra import needed) fetches that address list, and
+`round_robin` picks a different one per RPC. `deploy/kubernetes/loadgen-job.yaml`
+targets `dns:///safer-worker-headless:50052` accordingly. A comma-separated
+list of literal addresses is also accepted, using gRPC's manual resolver
+instead of DNS, for local testing against processes with no DNS name
+unifying them (see `integration/workerservice`).
+
+The claim that requests actually reached more than one replica is no
+longer asserted without evidence: every worker attaches a response-header
+instance identifier to each RPC it serves (`internal/workerdiag`,
+`cmd/worker/instance.go`, deliberately kept out of `worker.v1`'s protobuf
+messages, since which pod handled a request is deployment metadata, not
+part of SAFER's business API), and `cmd/loadgen`'s report includes a
+`replicas_served=N` line built from it. `integration/workerservice` fails
+the build if a run against three real worker processes reports fewer than
+two.
 
 ### Evidence
 
@@ -528,7 +570,7 @@ throughput/latency benchmark -- that comes later, once observability exists.
 | Worker refuses bad/missing config | `cmd/worker`'s `parseConfig` unit-tested: missing MongoDB, missing coordinator, missing both, non-positive timeouts |
 | Multiple worker replicas serve one deployment correctly | `integration/workerservice`: real worker and coordinator processes, `InitUser` on one replica, `StoreFile`/`AppendToFile`/`LoadFile` on others, for two independent users, against one MongoDB |
 | Readiness/liveness semantics | `integration/workerservice`: a live worker reports `SERVING` on both the default (readiness) and `"liveness"` gRPC health services |
-| Load generator drives the worker Service | `integration/workerservice`: all four workload types run against two real worker replicas with zero errors; also run manually against Docker containers (see `docker/README.md`) |
+| Load generator drives worker replicas, and balancing is real, not assumed | `integration/workerservice`: all four workload types run against three real worker processes with zero errors, asserting `replicas_served >= 2` parsed from loadgen's own report; the `dns:///` + `round_robin` mechanism itself verified separately against three Docker containers sharing one DNS name -- `replicas_served=3`, an even 32/32/32 split (see `docker/README.md`) |
 | Docker images build and interoperate | All three images built and smoke-tested together on a Docker network against a real MongoDB replica set (`docker/README.md`); now also built (not run) on every CI push (`.github/workflows/ci.yml`'s `docker` job) |
 | Kubernetes manifests are internally consistent | `deploy/kubernetes/manifest_test.go`: `kubectl kustomize` builds the full manifest set and the files intentionally excluded from it, catching a broken cross-reference (e.g. a Service selector that stops matching a Deployment's labels) |
 | Existing Phase 1-3C correctness | Full suite (`go test ./...`, with and without `SAFER_MONGO_URI`) re-run clean after every Phase 4 change, including `integration/crossprocess` and `integration/rollback_test.go` |
