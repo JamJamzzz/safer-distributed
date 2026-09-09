@@ -9,9 +9,12 @@ import (
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/JamJamzzz/safer-distributed/client/coordination"
+	"github.com/JamJamzzz/safer-distributed/client/fencing"
 	"github.com/JamJamzzz/safer-distributed/client/lockmanager"
 	coordinatorv1 "github.com/JamJamzzz/safer-distributed/proto/coordinator/v1"
 )
@@ -34,6 +37,11 @@ const DefaultTimeout = 10 * time.Second
 type Config struct {
 	Address string
 	Timeout time.Duration
+	// RenewInterval is how often a transaction renews its lease. It
+	// should be a fraction of the coordinator's lease duration, so that
+	// several renewals can be lost before the lease is considered
+	// passed. Defaults to a third of DefaultLeaseDuration.
+	RenewInterval time.Duration
 }
 
 // ConfigFromEnv builds a Config from the environment. It reports
@@ -74,6 +82,8 @@ type Backend struct {
 	conn    *grpc.ClientConn
 	client  coordinatorv1.LockCoordinatorClient
 	timeout time.Duration
+	// renewInterval is how often a transaction renews its lease.
+	renewInterval time.Duration
 }
 
 var _ coordination.Backend = (*Backend)(nil)
@@ -100,10 +110,15 @@ func Dial(ctx context.Context, cfg Config) (*Backend, error) {
 		return nil, fmt.Errorf("grpccoord: dial %s: %w", cfg.Address, err)
 	}
 
+	renewInterval := cfg.RenewInterval
+	if renewInterval <= 0 {
+		renewInterval = DefaultLeaseDuration / 3
+	}
 	backend := &Backend{
-		conn:    conn,
-		client:  coordinatorv1.NewLockCoordinatorClient(conn),
-		timeout: cfg.Timeout,
+		conn:          conn,
+		client:        coordinatorv1.NewLockCoordinatorClient(conn),
+		timeout:       cfg.Timeout,
+		renewInterval: renewInterval,
 	}
 	if err := backend.Health(ctx); err != nil {
 		_ = conn.Close()
@@ -121,7 +136,12 @@ func Dial(ctx context.Context, cfg Config) (*Backend, error) {
 // lazily on the first Acquire, which is why there is no BeginTransaction
 // RPC.
 func (b *Backend) Begin(_ lockmanager.TxnID) (coordination.Guard, error) {
-	return &remoteGuard{backend: b, txn: uuid.New()}, nil
+	return &remoteGuard{
+		backend:       b,
+		txn:           uuid.New(),
+		stopHeartbeat: make(chan struct{}),
+		lost:          make(chan struct{}),
+	}, nil
 }
 
 // Health reports whether the coordinator is serving.
@@ -149,12 +169,30 @@ type remoteGuard struct {
 	backend *Backend
 	txn     uuid.UUID
 
+	mu sync.Mutex
 	// acquired records whether this transaction ever asked for a lock.
 	// A transaction that never acquired anything has no state on the
 	// coordinator, so ending it would be a pointless round trip.
-	mu       sync.Mutex
 	acquired bool
 	ended    bool
+	// grants are the fencing tokens this transaction was issued, one per
+	// exclusive lock. They are kept for the life of the transaction
+	// because the storage commit has to prove every one of them: an
+	// operation that took X on several resources loses the whole
+	// mutation if it lost any single lock.
+	grants []fencing.Grant
+
+	// heartbeat renews the lease. It starts on the first successful
+	// grant -- before that there is no lease, because nothing is held --
+	// and stops when the transaction ends.
+	heartbeatStarted bool
+	stopHeartbeat    chan struct{}
+	heartbeatDone    sync.WaitGroup
+	// lost is closed if the coordinator ever tells this transaction its
+	// lease is gone, so the worker can find out it no longer holds its
+	// locks.
+	lostOnce sync.Once
+	lost     chan struct{}
 }
 
 // Acquire blocks until the coordinator grants the lock.
@@ -184,7 +222,7 @@ func (g *remoteGuard) Acquire(resource lockmanager.ResourceID, mode lockmanager.
 	g.acquired = true
 	g.mu.Unlock()
 
-	_, err = g.backend.client.Acquire(context.Background(), &coordinatorv1.AcquireRequest{
+	response, err := g.backend.client.Acquire(context.Background(), &coordinatorv1.AcquireRequest{
 		TransactionId: g.txn.String(),
 		Resource:      protoResource,
 		Mode:          protoMode,
@@ -192,7 +230,96 @@ func (g *remoteGuard) Acquire(resource lockmanager.ResourceID, mode lockmanager.
 	if err != nil {
 		return fmt.Errorf("grpccoord: acquire %s on %v: %w", mode, resource, err)
 	}
+
+	g.mu.Lock()
+	if mode == lockmanager.ExclusiveLock && response.GetFencingToken() != 0 {
+		g.grants = append(g.grants, fencing.Grant{
+			Resource: fencing.ResourceKey(uint8(resource.Type), resource.Key),
+			Token:    fencing.Token(response.GetFencingToken()),
+			OwnerTxn: g.txn.String(),
+		})
+	}
+	// The lease exists from the first grant onward, so renewal starts
+	// here. Before it, the transaction holds nothing to keep alive.
+	startHeartbeat := !g.heartbeatStarted && !g.ended
+	if startHeartbeat {
+		g.heartbeatStarted = true
+		g.heartbeatDone.Add(1)
+	}
+	g.mu.Unlock()
+
+	if startHeartbeat {
+		go g.heartbeat()
+	}
 	return nil
+}
+
+// FenceGrants returns the fencing grants this transaction holds.
+//
+// The caller presents them to its storage transaction, which proves them
+// at commit time. Returning a copy keeps a later acquisition from
+// mutating a slice an in-flight commit is already validating.
+func (g *remoteGuard) FenceGrants() []fencing.Grant {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.grants) == 0 {
+		return nil
+	}
+	grants := make([]fencing.Grant, len(g.grants))
+	copy(grants, g.grants)
+	return grants
+}
+
+// Lost is closed if the coordinator reports that this transaction's lease
+// is gone. A worker can watch it to stop early rather than doing work its
+// commit will refuse.
+func (g *remoteGuard) Lost() <-chan struct{} { return g.lost }
+
+// heartbeat renews the lease until the transaction ends.
+//
+// The interval is a fraction of the lease so that several renewals can be
+// lost -- to a GC pause, a slow network, a busy coordinator -- before the
+// coordinator considers the lease passed. Renewing at the lease length
+// itself would make every hiccup a revocation.
+func (g *remoteGuard) heartbeat() {
+	defer g.heartbeatDone.Done()
+
+	interval := g.backend.renewInterval
+	if interval <= 0 {
+		interval = DefaultLeaseDuration / 3
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-g.stopHeartbeat:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), g.backend.timeout)
+			_, err := g.backend.client.RenewLease(ctx, &coordinatorv1.RenewLeaseRequest{
+				TransactionId: g.txn.String(),
+			})
+			cancel()
+			if err == nil {
+				continue
+			}
+			if status.Code(err) == codes.FailedPrecondition {
+				// The coordinator no longer recognizes this transaction
+				// as active: its lease passed and its locks were taken
+				// away. Renewing again cannot help, and fencing will
+				// refuse the commit regardless.
+				g.lostOnce.Do(func() { close(g.lost) })
+				fmt.Fprintf(os.Stderr,
+					"grpccoord: transaction %s lost its lease: %v\n", g.txn, err)
+				return
+			}
+			// A transient failure. Keep trying: the lease may still be
+			// alive, and giving up early would guarantee losing it.
+			fmt.Fprintf(os.Stderr,
+				"grpccoord: renewing the lease for %s failed, will retry: %v\n", g.txn, err)
+		}
+	}
 }
 
 // ReleaseAll ends the transaction, releasing every lock it holds.
@@ -208,13 +335,25 @@ func (g *remoteGuard) Acquire(resource lockmanager.ResourceID, mode lockmanager.
 // gap leases and fencing tokens close in the next phase.
 func (g *remoteGuard) ReleaseAll() {
 	g.mu.Lock()
-	if g.ended || !g.acquired {
-		g.ended = true
+	if g.ended {
 		g.mu.Unlock()
 		return
 	}
 	g.ended = true
+	acquired := g.acquired
+	started := g.heartbeatStarted
 	g.mu.Unlock()
+
+	// Stop renewing before ending: a renewal racing an EndTransaction
+	// would only fail noisily.
+	if started {
+		close(g.stopHeartbeat)
+		g.heartbeatDone.Wait()
+	}
+
+	if !acquired {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), g.backend.timeout)
 	defer cancel()
@@ -223,8 +362,12 @@ func (g *remoteGuard) ReleaseAll() {
 		TransactionId: g.txn.String(),
 	}); err != nil {
 		// Nowhere to return this. Make it visible rather than silent: a
-		// failed EndTransaction means locks are still held remotely.
-		fmt.Fprintf(os.Stderr, "grpccoord: EndTransaction for %s failed, locks may be leaked: %v\n", g.txn, err)
+		// failed EndTransaction means locks are still held remotely --
+		// though unlike before Phase 3C, no longer held forever, since
+		// the lease expires and the coordinator reclaims them.
+		fmt.Fprintf(os.Stderr,
+			"grpccoord: EndTransaction for %s failed; its lease will expire and the coordinator will reclaim: %v\n",
+			g.txn, err)
 	}
 }
 

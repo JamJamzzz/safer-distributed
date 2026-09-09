@@ -21,6 +21,7 @@ package coordination
 import (
 	"context"
 
+	"github.com/JamJamzzz/safer-distributed/client/fencing"
 	"github.com/JamJamzzz/safer-distributed/client/lockmanager"
 )
 
@@ -39,6 +40,29 @@ type Guard interface {
 	// must be safe to call more than once, since operations call it both
 	// on the success path and from a deferred cleanup.
 	ReleaseAll()
+}
+
+// FencedGuard is implemented by guards whose grants carry fencing tokens.
+//
+// The local backend does not implement it: within one process there is no
+// stale-writer problem to solve, because a transaction cannot outlive the
+// process that is driving it. A remote guard does, and its grants must
+// reach the storage transaction that commits the work.
+type FencedGuard interface {
+	Guard
+	// FenceGrants returns the fencing grants this transaction holds, one
+	// per exclusive lock.
+	FenceGrants() []fencing.Grant
+}
+
+// GrantsOf returns a guard's fencing grants, or nil when the guard is not
+// fenced.
+func GrantsOf(guard Guard) []fencing.Grant {
+	fenced, ok := guard.(FencedGuard)
+	if !ok {
+		return nil
+	}
+	return fenced.FenceGrants()
 }
 
 // Backend hands out guards. Implementations are the process-local lock

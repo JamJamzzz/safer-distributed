@@ -5,120 +5,204 @@
 // The server contains no locking logic of its own. Every decision is made
 // by an ordinary *lockmanager.LockManager -- the same generic core SAFER-CC
 // has always used, with its S/X compatibility rules, FIFO fairness, and
-// holder/waiter bookkeeping unchanged. This package only does three
-// things: translate the wire types, map externally-generated transaction
-// UUIDs onto the manager's internal uint64 TxnIDs, and make sure a caller
-// that disappears does not leave a request queued.
+// holder/waiter bookkeeping unchanged. This package translates wire types,
+// maps externally-generated transaction UUIDs onto the manager's internal
+// uint64 TxnIDs, keeps the lease and fencing state the manager has no
+// opinion about, and makes sure a caller that disappears leaves no request
+// queued.
 //
-// Scope and limits of this phase, stated plainly:
+// Worker failure (Phase 3C). A transaction's lease starts when its first
+// lock is granted, and the worker renews it while it works. A passed
+// deadline does not release anything by itself; it makes the transaction
+// eligible for revocation, which happens in a fixed order:
+//
+//  1. mark the transaction revoking, so it accepts no further Acquire or
+//     RenewLease
+//  2. cancel its in-flight Acquire requests
+//  3. durably invalidate every exclusive fence it owns
+//  4. only then release its locks through the LockManager
+//  5. remove its state
+//
+// Step 3 before step 4 is the safety property. Releasing locks first would
+// let the next holder start writing while the previous holder's fencing
+// token was still valid, which is exactly the stale write fencing exists
+// to stop. If the fence store is unreachable, the locks STAY HELD and
+// cleanup retries: an availability loss is preferable to an unsafe
+// handoff.
+//
+// Scope and limits, stated plainly:
 //
 //   - There is exactly one coordinator process. It is not replicated, and
-//     there is no consensus of any kind.
-//   - Lock state is in memory. If the coordinator dies, that state is
-//     gone; workers holding locks will not be told, and correctness is
-//     lost until everything restarts.
-//   - There are no leases and no fencing tokens. A worker that crashes
-//     without calling EndTransaction leaks its locks until the
-//     coordinator restarts.
+//     there is no consensus of any kind. It remains an explicit failure
+//     domain: if it dies, its in-memory lock state dies with it.
+//   - Fence state is durable, but lock state is not. A coordinator restart
+//     loses who held what.
 //
-// So this earns a cross-process coordination claim under normal, graceful
-// operation. It earns no fault-tolerance claim.
+// So this earns worker crash recovery, bounded lock reclamation, and
+// stale-writer protection. It does not earn coordinator fault tolerance.
 package grpccoord
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
+	"log"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/JamJamzzz/safer-distributed/client/fencing"
 	"github.com/JamJamzzz/safer-distributed/client/lockmanager"
 	coordinatorv1 "github.com/JamJamzzz/safer-distributed/proto/coordinator/v1"
 )
+
+// FenceStore is the durable fencing metadata the coordinator depends on.
+// *mongofence.Store implements it; tests substitute failing versions.
+type FenceStore interface {
+	// Allocate advances a resource's token and records the new owner.
+	Allocate(ctx context.Context, resource string, ownerTxn string) (fencing.Token, error)
+	// Invalidate clears a transaction's ownership of a resource's fence.
+	Invalidate(ctx context.Context, resource string, ownerTxn string) error
+}
+
+// Defaults for lease timing.
+const (
+	// DefaultLeaseDuration is how long a grant survives without a
+	// renewal. Long enough to absorb an ordinary GC pause or a slow
+	// storage call, short enough that a dead worker's locks come back in
+	// seconds rather than minutes.
+	DefaultLeaseDuration = 6 * time.Second
+	// DefaultSweepInterval is how often expired leases are looked for.
+	DefaultSweepInterval = 500 * time.Millisecond
+	// DefaultCleanupRetryInterval is how long to wait before retrying a
+	// revocation whose fence invalidation failed.
+	DefaultCleanupRetryInterval = time.Second
+)
+
+// tombstoneRetention is how long a finished transaction's record is kept
+// so that a returning worker is told its transaction is over rather than
+// silently given a fresh one. It only has to outlast a worker that may
+// still believe it holds locks.
+func tombstoneRetention(lease time.Duration) time.Duration {
+	retention := 10 * lease
+	if retention < 5*time.Second {
+		retention = 5 * time.Second
+	}
+	if retention > 5*time.Minute {
+		retention = 5 * time.Minute
+	}
+	return retention
+}
+
+// ServerConfig configures a coordinator.
+type ServerConfig struct {
+	// LockManager is the generic core. Nil creates a fresh one.
+	LockManager *lockmanager.LockManager
+	// Fences is the durable fence store. Nil disables fencing entirely,
+	// which is only appropriate for tests that exercise lock semantics
+	// alone -- a coordinator with no fence store cannot protect against
+	// stale writers.
+	Fences FenceStore
+
+	LeaseDuration        time.Duration
+	SweepInterval        time.Duration
+	CleanupRetryInterval time.Duration
+
+	// Logf receives cleanup failures. Nil uses the standard logger.
+	Logf func(format string, args ...interface{})
+}
 
 // Server is the lock coordinator.
 type Server struct {
 	coordinatorv1.UnimplementedLockCoordinatorServer
 
-	lm *lockmanager.LockManager
+	lm       *lockmanager.LockManager
+	fences   FenceStore
+	registry *registry
 
-	// mu protects the transaction table only. It is never held across an
-	// Acquire wait: a blocking acquisition would otherwise stall every
-	// other transaction's bookkeeping, including the EndTransaction that
-	// would have unblocked it.
-	mu sync.Mutex
-	// txns maps a worker-generated transaction UUID to the internal
-	// lock-manager id. The external identity must be globally unique
-	// across workers, which a process-local counter is not; the internal
-	// uint64 is unchanged, so the existing LockManager is reused exactly
-	// as it is.
-	txns      map[uuid.UUID]lockmanager.TxnID
-	nextTxn   uint64
-	exhausted bool
+	leaseDuration        time.Duration
+	sweepInterval        time.Duration
+	cleanupRetryInterval time.Duration
+	tombstoneRetention   time.Duration
+	logf                 func(format string, args ...interface{})
+
+	// retryMu guards the set of transactions whose cleanup failed and is
+	// being retried, so a sweeper tick cannot start a second cleanup for
+	// one already in progress.
+	retryMu  sync.Mutex
+	retrying map[uuid.UUID]bool
+
+	stopOnce sync.Once
+	stop     chan struct{}
+	stopped  sync.WaitGroup
 }
 
-// NewServer builds a coordinator over the given lock manager. Passing an
-// existing manager keeps this package free of locking logic; passing nil
-// creates a fresh one.
+// NewServer builds a coordinator with default lease timing and no fence
+// store. Prefer NewServerWithConfig for anything that needs fencing.
 func NewServer(lm *lockmanager.LockManager) *Server {
-	if lm == nil {
-		lm = lockmanager.NewLockManager()
+	return NewServerWithConfig(ServerConfig{LockManager: lm})
+}
+
+// NewServerWithConfig builds a coordinator and starts its lease sweeper.
+func NewServerWithConfig(cfg ServerConfig) *Server {
+	if cfg.LockManager == nil {
+		cfg.LockManager = lockmanager.NewLockManager()
 	}
-	return &Server{
-		lm:   lm,
-		txns: make(map[uuid.UUID]lockmanager.TxnID),
+	if cfg.LeaseDuration <= 0 {
+		cfg.LeaseDuration = DefaultLeaseDuration
 	}
+	if cfg.SweepInterval <= 0 {
+		cfg.SweepInterval = DefaultSweepInterval
+	}
+	if cfg.CleanupRetryInterval <= 0 {
+		cfg.CleanupRetryInterval = DefaultCleanupRetryInterval
+	}
+	if cfg.Logf == nil {
+		cfg.Logf = log.Printf
+	}
+
+	s := &Server{
+		lm:                   cfg.LockManager,
+		fences:               cfg.Fences,
+		registry:             newRegistry(cfg.LeaseDuration),
+		leaseDuration:        cfg.LeaseDuration,
+		sweepInterval:        cfg.SweepInterval,
+		cleanupRetryInterval: cfg.CleanupRetryInterval,
+		tombstoneRetention:   tombstoneRetention(cfg.LeaseDuration),
+		logf:                 cfg.Logf,
+		retrying:             make(map[uuid.UUID]bool),
+		stop:                 make(chan struct{}),
+	}
+	s.stopped.Add(1)
+	go s.sweepLeases()
+	return s
+}
+
+// Stop halts the lease sweeper. In-flight cleanups are allowed to finish.
+func (s *Server) Stop() {
+	s.stopOnce.Do(func() { close(s.stop) })
+	s.stopped.Wait()
 }
 
 // LockManager exposes the underlying manager for tests and diagnostics.
 func (s *Server) LockManager() *lockmanager.LockManager { return s.lm }
 
-// internalTxn returns the lock-manager id for an external transaction
-// UUID, creating it on first use.
-//
-// Lazy creation is why there is no BeginTransaction RPC: the worker
-// generates its own UUID locally, and the coordinator materializes state
-// when the transaction first needs a lock. A transaction that never
-// acquires anything costs the coordinator nothing.
-func (s *Server) internalTxn(external uuid.UUID) (lockmanager.TxnID, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if id, ok := s.txns[external]; ok {
-		return id, nil
-	}
-	if s.exhausted || s.nextTxn == math.MaxUint64 {
-		// Refuse permanently rather than wrapping to 0, which is the
-		// lock manager's reserved invalid id, or recycling an id a live
-		// transaction still holds locks under.
-		s.exhausted = true
-		return 0, errors.New("grpccoord: transaction ID space exhausted")
-	}
-	s.nextTxn++
-	id := lockmanager.TxnID(s.nextTxn)
-	s.txns[external] = id
-	return id, nil
-}
-
-// stillLive reports whether external is still the transaction that owns
-// internal id txn -- that is, whether EndTransaction has run in the
-// meantime.
-func (s *Server) stillLive(external uuid.UUID, txn lockmanager.TxnID) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	current, ok := s.txns[external]
-	return ok && current == txn
-}
+// LeaseDuration reports the configured lease length, so a worker can pick
+// a renewal interval from it.
+func (s *Server) LeaseDuration() time.Duration { return s.leaseDuration }
 
 // Acquire blocks until the transaction holds the requested mode.
 //
-// It uses AcquireContext, so a caller that disconnects or gives up has its
-// request removed from the wait queue instead of being granted a lock
-// nobody will release.
+// It is retry-safe. An identical request for a resource this transaction
+// already holds returns the existing grant and the very same fencing
+// token, without touching the LockManager and without allocating a second
+// token, so a retry after a lost response recovers the original outcome
+// rather than inventing a new grant. A request for a DIFFERENT mode on a
+// held resource is still rejected: there are no upgrades and no
+// reentrancy, exactly as before.
 func (s *Server) Acquire(ctx context.Context, req *coordinatorv1.AcquireRequest) (*coordinatorv1.AcquireResponse, error) {
 	external, err := parseTxnID(req.GetTransactionId())
 	if err != nil {
@@ -133,88 +217,327 @@ func (s *Server) Acquire(ctx context.Context, req *coordinatorv1.AcquireRequest)
 		return nil, err
 	}
 
-	txn, err := s.internalTxn(external)
+	txn, err := s.registry.ensure(external)
 	if err != nil {
-		return nil, status.Error(codes.ResourceExhausted, err.Error())
-	}
-
-	if err := s.lm.AcquireContext(ctx, txn, resource, mode); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			// The caller went away. The request left the queue; nothing
-			// is held. The worker will still call EndTransaction.
-			return nil, status.FromContextError(ctxErr).Err()
+		if errors.Is(err, errTxnIDsExhausted) {
+			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		}
-		// A programming error from the caller: re-acquiring a resource
-		// this transaction already holds, or an invalid mode.
+		// The transaction is being revoked or ended: it must not be able
+		// to take more locks.
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 
-	// The transaction may have ended while this request sat in the queue.
-	// Releasing on EndTransaction alone would not have covered this: the
-	// request was not yet granted then, so there was nothing to release,
-	// and the grant that arrives afterwards would be held by a
-	// transaction nobody will ever end -- a ghost lock. Undo it here
-	// instead of handing back a lock that outlives its transaction.
-	if !s.stillLive(external, txn) {
-		if releaseErr := s.lm.ReleaseAll(txn); releaseErr != nil {
-			return nil, status.Errorf(codes.Internal,
-				"grpccoord: releasing a lock granted after its transaction ended: %v", releaseErr)
+	// Idempotent retry. Checked before going near the LockManager, which
+	// would otherwise reject the second request as reentrant acquisition.
+	if existing, held := s.heldGrant(txn, resource); held {
+		if existing.mode != mode {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"grpccoord: transaction %s already holds %s on %v; upgrades are not supported",
+				external, existing.mode, resource)
 		}
+		return &coordinatorv1.AcquireResponse{
+			FencingToken:         uint64(existing.token),
+			LeaseExpiresUnixNano: s.leaseDeadline(txn).UnixNano(),
+		}, nil
+	}
+
+	// The wait is cancellable, and its cancel function is registered so
+	// revocation can pull the request out of the queue. Registering takes
+	// the table mutex briefly; the wait itself happens with no
+	// coordinator lock held, or the EndTransaction that would unblock it
+	// could never run.
+	waitCtx, cancel := context.WithCancel(ctx)
+	requestID := s.registry.registerPending(txn, cancel)
+	err = s.lm.AcquireContext(waitCtx, txn.internal, resource, mode)
+	s.registry.clearPending(txn, requestID)
+	cancel()
+
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// The caller went away. The request left the queue; nothing
+			// is held. The worker still calls EndTransaction.
+			return nil, status.FromContextError(ctxErr).Err()
+		}
+		if waitCtx.Err() != nil {
+			// Cancelled by revocation rather than by the caller.
+			return nil, status.Errorf(codes.Aborted,
+				"grpccoord: transaction %s was revoked while waiting for %v", external, resource)
+		}
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+
+	// Granted. From here, any failure must give the lock back rather than
+	// leave it held by a transaction the worker does not know succeeded.
+	if !s.stillActive(external, txn) {
+		s.releaseOne(txn, resource)
 		return nil, status.Error(codes.Aborted, "grpccoord: transaction ended while the request was queued")
 	}
-	return &coordinatorv1.AcquireResponse{}, nil
+
+	var token fencing.Token
+	if mode == lockmanager.ExclusiveLock && s.fences != nil {
+		// Fail closed: an exclusive grant is only handed out once its
+		// fencing token is durable. Returning an unfenced X grant would
+		// create a writer nothing could later stop.
+		token, err = s.fences.Allocate(ctx,
+			fencing.ResourceKey(uint8(resource.Type), resource.Key), external.String())
+		if err != nil {
+			s.releaseOne(txn, resource)
+			return nil, status.Errorf(codes.Unavailable,
+				"grpccoord: could not allocate a fencing token for %v, refusing the grant: %v", resource, err)
+		}
+	}
+
+	s.registry.recordGrant(txn, grantRecord{resource: resource, mode: mode, token: token})
+	deadline := s.registry.startLeaseIfNeeded(txn)
+
+	return &coordinatorv1.AcquireResponse{
+		FencingToken:         uint64(token),
+		LeaseExpiresUnixNano: deadline.UnixNano(),
+	}, nil
+}
+
+// heldGrant reports an existing grant for a resource under the table lock.
+func (s *Server) heldGrant(txn *transaction, resource lockmanager.ResourceID) (grantRecord, bool) {
+	s.registry.mu.Lock()
+	defer s.registry.mu.Unlock()
+	return txn.grantFor(resource)
+}
+
+func (s *Server) leaseDeadline(txn *transaction) time.Time {
+	s.registry.mu.Lock()
+	defer s.registry.mu.Unlock()
+	return txn.leaseDeadline
+}
+
+// stillActive reports whether external still maps to this exact
+// transaction and is still accepting work.
+func (s *Server) stillActive(external uuid.UUID, txn *transaction) bool {
+	s.registry.mu.Lock()
+	defer s.registry.mu.Unlock()
+	current, ok := s.registry.byID[external]
+	return ok && current == txn && txn.state == txnActive
+}
+
+// releaseOne gives back a single lock that was granted but could not be
+// completed. It is not a protocol operation -- there is no per-resource
+// Release on the wire -- only an internal undo of a grant the caller never
+// learned about.
+func (s *Server) releaseOne(txn *transaction, resource lockmanager.ResourceID) {
+	if err := s.lm.Release(txn.internal, resource); err != nil {
+		s.logf("grpccoord: undoing a grant of %v for %s: %v", resource, txn.external, err)
+	}
+}
+
+// RenewLease extends a transaction's lease.
+//
+// It is idempotent: renewing repeatedly just moves the deadline. It fails
+// once the transaction is revoking or gone, which is how a worker learns
+// it has lost its locks instead of continuing to believe it holds them.
+func (s *Server) RenewLease(ctx context.Context, req *coordinatorv1.RenewLeaseRequest) (*coordinatorv1.RenewLeaseResponse, error) {
+	external, err := parseTxnID(req.GetTransactionId())
+	if err != nil {
+		return nil, err
+	}
+	deadline, err := s.registry.renew(external)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	return &coordinatorv1.RenewLeaseResponse{LeaseExpiresUnixNano: deadline.UnixNano()}, nil
 }
 
 // EndTransaction releases every lock the transaction holds.
 //
 // This is the only way locks are released, which is what makes the
-// protocol strict 2PL rather than something weaker. It is idempotent:
-// ending a transaction the coordinator has never heard of succeeds and
-// reports zero released, so a worker can safely call it on every path,
-// including after an Acquire whose response never arrived.
+// protocol strict 2PL. It is idempotent: ending an unknown transaction
+// succeeds and reports zero released, so a worker can call it on every
+// path including after an Acquire whose response never arrived.
+//
+// It invalidates the transaction's fences BEFORE releasing its locks, for
+// the same reason revocation does: once the next holder can start writing,
+// this transaction's token must already be dead.
 func (s *Server) EndTransaction(ctx context.Context, req *coordinatorv1.EndTransactionRequest) (*coordinatorv1.EndTransactionResponse, error) {
 	external, err := parseTxnID(req.GetTransactionId())
 	if err != nil {
 		return nil, err
 	}
 
-	s.mu.Lock()
-	txn, known := s.txns[external]
-	if known {
-		delete(s.txns, external)
-	}
-	s.mu.Unlock()
-
-	if !known {
+	txn, cancels, ok := s.registry.beginTeardown(external, txnEnding)
+	if !ok {
+		// Unknown, or already being torn down. Either way there is
+		// nothing for this call to do.
 		return &coordinatorv1.EndTransactionResponse{Released: 0}, nil
 	}
+	for _, cancel := range cancels {
+		cancel()
+	}
 
-	released := uint32(s.lm.HeldCount(txn))
-	if err := s.lm.ReleaseAll(txn); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("grpccoord: releasing transaction: %v", err))
+	released, err := s.teardown(ctx, txn)
+	if err != nil {
+		// The locks are deliberately still held; cleanup will retry.
+		s.scheduleRetry(txn)
+		return nil, status.Errorf(codes.Unavailable,
+			"grpccoord: could not invalidate fencing state for %s, locks are still held and cleanup will retry: %v",
+			external, err)
 	}
 	return &coordinatorv1.EndTransactionResponse{Released: released}, nil
 }
 
+// teardown invalidates a transaction's fences and then releases its locks.
+//
+// The order is the safety property of this phase. Fence invalidation must
+// be durable before the locks move, because the instant they move another
+// worker may begin writing, and this transaction's token must already be
+// unusable by then.
+//
+// A fence-store failure returns an error WITHOUT releasing anything. The
+// locks stay held on purpose: an unavailable resource is a much smaller
+// problem than two writers who both believe they hold it.
+func (s *Server) teardown(ctx context.Context, txn *transaction) (uint32, error) {
+	grants := s.fenceGrantsOf(txn)
+	if s.fences != nil {
+		for _, grant := range grants {
+			if err := s.fences.Invalidate(ctx, grant.Resource, grant.OwnerTxn); err != nil {
+				return 0, fmt.Errorf("invalidating %s: %w", grant, err)
+			}
+		}
+	}
+
+	released := uint32(s.lm.HeldCount(txn.internal))
+	if err := s.lm.ReleaseAll(txn.internal); err != nil {
+		// Bookkeeping inconsistency rather than a storage failure; the
+		// transaction's state still has to go, or it would be retried
+		// forever.
+		s.logf("grpccoord: releasing locks for %s: %v", txn.external, err)
+	}
+	s.registry.finish(txn.external)
+	return released, nil
+}
+
+func (s *Server) fenceGrantsOf(txn *transaction) []fencing.Grant {
+	s.registry.mu.Lock()
+	defer s.registry.mu.Unlock()
+	return txn.fenceGrants()
+}
+
+// sweepLeases revokes transactions whose leases have passed.
+func (s *Server) sweepLeases() {
+	defer s.stopped.Done()
+
+	ticker := time.NewTicker(s.sweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			for _, external := range s.registry.expired(now) {
+				s.revoke(external)
+			}
+			s.registry.prune(now, s.tombstoneRetention)
+		}
+	}
+}
+
+// revoke performs the ordered teardown of a transaction whose lease has
+// passed.
+func (s *Server) revoke(external uuid.UUID) {
+	// 1. Mark it revoking. From here it accepts no Acquire and no
+	//    RenewLease, so a worker that comes back learns it lost its
+	//    locks, and nothing can be added while cleanup runs.
+	txn, cancels, ok := s.registry.beginTeardown(external, txnRevoking)
+	if !ok {
+		return
+	}
+	s.logf("grpccoord: lease expired for transaction %s, revoking", external)
+
+	// 2. Cancel its in-flight Acquire requests, so a queued request
+	//    cannot be granted to a transaction being torn down.
+	for _, cancel := range cancels {
+		cancel()
+	}
+
+	// 3 and 4: invalidate fences durably, and only then release locks.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := s.teardown(ctx, txn); err != nil {
+		s.logf("grpccoord: could not invalidate fencing state for %s; "+
+			"KEEPING ITS LOCKS HELD and retrying: %v", external, err)
+		s.scheduleRetry(txn)
+		return
+	}
+	s.logf("grpccoord: transaction %s revoked and its locks released", external)
+}
+
+// scheduleRetry keeps retrying a teardown whose fence invalidation failed.
+//
+// The transaction stays in the revoking state throughout, so its locks
+// remain held and no one else can take them. This is the deliberate trade:
+// SAFER would rather block on a resource than hand it to a second writer
+// while the first one's fencing token is still live.
+func (s *Server) scheduleRetry(txn *transaction) {
+	s.retryMu.Lock()
+	if s.retrying[txn.external] {
+		s.retryMu.Unlock()
+		return
+	}
+	s.retrying[txn.external] = true
+	s.retryMu.Unlock()
+
+	s.stopped.Add(1)
+	go func() {
+		defer s.stopped.Done()
+		defer func() {
+			s.retryMu.Lock()
+			delete(s.retrying, txn.external)
+			s.retryMu.Unlock()
+		}()
+
+		ticker := time.NewTicker(s.cleanupRetryInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-s.stop:
+				s.logf("grpccoord: stopping with transaction %s still uncleaned; "+
+					"its locks were never handed over", txn.external)
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, err := s.teardown(ctx, txn)
+				cancel()
+				if err == nil {
+					s.logf("grpccoord: cleanup for %s succeeded on retry; locks released", txn.external)
+					return
+				}
+				s.logf("grpccoord: cleanup for %s still failing, locks remain held: %v", txn.external, err)
+			}
+		}
+	}()
+}
+
 // Health reports that the coordinator is serving, with a point-in-time
 // sample of how much state it holds.
+//
+// RevokingTransactions is the operationally important one: a number that
+// stays above zero means fence invalidation is failing and locks are being
+// held on purpose rather than leaked by accident.
 func (s *Server) Health(ctx context.Context, _ *coordinatorv1.HealthRequest) (*coordinatorv1.HealthResponse, error) {
-	s.mu.Lock()
-	active := len(s.txns)
-	s.mu.Unlock()
-
+	active, revoking := s.registry.counts()
 	return &coordinatorv1.HealthResponse{
-		ActiveTransactions: uint32(active),
-		HeldLocks:          uint32(s.lm.TotalHeldCount()),
+		ActiveTransactions:   uint32(active),
+		HeldLocks:            uint32(s.lm.TotalHeldCount()),
+		RevokingTransactions: uint32(revoking),
 	}, nil
 }
 
 // ActiveTransactions reports how many transactions the coordinator is
 // tracking. Diagnostic only.
 func (s *Server) ActiveTransactions() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.txns)
+	active, revoking := s.registry.counts()
+	return active + revoking
 }
 
 func parseTxnID(raw string) (uuid.UUID, error) {

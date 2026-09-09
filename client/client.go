@@ -28,6 +28,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/JamJamzzz/safer-distributed/client/coordination"
+	"github.com/JamJamzzz/safer-distributed/client/fencing"
 	"github.com/JamJamzzz/safer-distributed/client/lockmanager"
 	"github.com/JamJamzzz/safer-distributed/client/storage"
 
@@ -196,6 +197,22 @@ func UseUserlibStorage() (restore func()) {
 // and deadlines, and tracing later, without another refactor.
 func operationContext() context.Context { return context.Background() }
 
+// withFenceGrants attaches the transaction's fencing grants to ctx, so
+// the storage transaction that commits this operation can prove them.
+//
+// It is called after the operation has acquired every lock it needs and
+// before it mutates anything. The grants travel on the operation's own
+// context -- the same one that carries the MongoDB session -- so there is
+// no global state and no goroutine identity involved, and two concurrent
+// operations present only their own grants.
+//
+// With the process-local coordination backend this is a no-op: inside one
+// process a transaction cannot outlive the thing driving it, so there is
+// no stale writer to fence.
+func withFenceGrants(ctx context.Context, guard lockGuardLike) context.Context {
+	return fencing.WithGrants(ctx, coordination.GrantsOf(guard))
+}
+
 // runAtomicStorage runs fn as one all-or-nothing storage mutation.
 //
 // It is the commit point of a SAFER operation. The order around it is
@@ -256,7 +273,7 @@ func keystoreSet(ctx context.Context, name string, key userlib.PublicKeyType) er
 
 // ---------------------------------------------------------------------
 
-//Constant variables
+// Constant variables
 const symmetricKeySize = 16
 
 // This is the type definition for the User struct.
@@ -282,7 +299,7 @@ type Account struct {
 	SignPrivate   userlib.DSSignKey
 }
 
-//Wrap the account and stored in an envelope
+// Wrap the account and stored in an envelope
 type AuthenticatedEnvelope struct {
 	Ciphertext []byte
 	MAC        []byte
@@ -290,36 +307,39 @@ type AuthenticatedEnvelope struct {
 
 //Basic Helper Methods:
 
-/**
+/*
+*
 Helper Method for InitUser
- **/
+
+	*
+*/
 func getUserUUID(username string) (uuid.UUID, error) {
 	userHash := userlib.Hash([]byte("user-record-" + username))
 	//Casting from the bytes to uuid
 	return uuid.FromBytes(userHash[:16])
 }
 
-//key generation:
-//Generate the public key
+// key generation:
+// Generate the public key
 func publicKeyName(domain string, username string) string {
 	nameHash := userlib.Hash([]byte(domain + ":" + username))
 	return hex.EncodeToString(nameHash[:16])
 }
 
-//Used to enc the account
+// Used to enc the account
 func getPKEKeyName(username string) string {
 	return publicKeyName("pke-public-key", username)
 }
 
-//Used to verify the d.s.
+// Used to verify the d.s.
 func getVerifyKeyName(username string) string {
 	return publicKeyName("signature-verify-key", username)
 }
 
-//To check whether this account is taken or not.
-//A storage failure is reported as an error rather than as "not taken":
-//treating an unreachable backend as a free username would let a second
-//account overwrite an existing one.
+// To check whether this account is taken or not.
+// A storage failure is reported as an error rather than as "not taken":
+// treating an unreachable backend as a free username would let a second
+// account overwrite an existing one.
 func isUsernameTaken(ctx context.Context, username string, accountUUID uuid.UUID) (bool, error) {
 	_, accountExists, err := datastoreGet(ctx, accountUUID)
 	if err != nil {
@@ -337,7 +357,7 @@ func isUsernameTaken(ctx context.Context, username string, accountUUID uuid.UUID
 	return accountExists || pkeExists || verifyExists, nil
 }
 
-//derive the secret keys for enc and mac
+// derive the secret keys for enc and mac
 func deriveAccountKey(username string, password string, accountUUID uuid.UUID) (
 	encKey []byte, macKey []byte, err error,
 ) {
@@ -365,7 +385,7 @@ func deriveAccountKey(username string, password string, accountUUID uuid.UUID) (
 	return encKey, macKey, nil
 }
 
-//Construction of mac meesage
+// Construction of mac meesage
 func accountMACMessage(accountUUID uuid.UUID, ciphertext []byte) []byte {
 	prefix := []byte(
 		"authenticated-account:" + accountUUID.String() + ":",
@@ -376,7 +396,7 @@ func accountMACMessage(accountUUID uuid.UUID, ciphertext []byte) []byte {
 	return message
 }
 
-//Encrypt then MAC
+// Encrypt then MAC
 func emacAccount(
 	account Account, accountUUID uuid.UUID, encKey []byte, macKey []byte,
 ) ([]byte, error) {
@@ -517,9 +537,9 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	return &userdata, nil
 }
 
- /** 
- Helper Method for GetUser
- **/
+/**
+Helper Method for GetUser
+**/
 //MAC then decrypt the account then open the account
 func openAccount(
 	envelopeBytes []byte,
@@ -535,15 +555,15 @@ func openAccount(
 	}
 
 	if len(macKey) != symmetricKeySize {
-        return emptyAccount, errors.New("invalid account MAC key")
-    }
+		return emptyAccount, errors.New("invalid account MAC key")
+	}
 
 	var envelope AuthenticatedEnvelope
 	err := json.Unmarshal(envelopeBytes, &envelope)
 	//Checking whether the envelope is valid or not
 	if err != nil {
-        return emptyAccount, errors.New("invalid account envelope")
-    }
+		return emptyAccount, errors.New("invalid account envelope")
+	}
 
 	if len(envelope.MAC) != userlib.HashSizeBytes {
 		return emptyAccount, errors.New("Invalid account MAC length")
@@ -569,15 +589,15 @@ func openAccount(
 		return emptyAccount, errors.New("account ciphertext is too short")
 	}
 
-	plaintext := userlib.SymDec(encKey, envelope.Ciphertext,)
+	plaintext := userlib.SymDec(encKey, envelope.Ciphertext)
 
 	var account Account
 	err = json.Unmarshal(plaintext, &account)
 	if err != nil {
-        return emptyAccount, errors.New("invalid account plaintext")
-    }
+		return emptyAccount, errors.New("invalid account plaintext")
+	}
 
-    return account, nil
+	return account, nil
 }
 
 func GetUser(username string, password string) (userdataptr *User, err error) {
@@ -587,9 +607,9 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	accountUUID, err := getUserUUID(username)
-    if err != nil {
-        return nil, err
-    }
+	if err != nil {
+		return nil, err
+	}
 
 	//Get the envelope
 	envelopeBytes, exists, err := datastoreGet(ctx, accountUUID)
@@ -625,60 +645,60 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	userdata := User{
-		Username: username,
+		Username:      username,
 		NamespaceRoot: account.NamespaceRoot,
-		PKEPrivate: account.PKEPrivate,
-		SignPrivate: account.SignPrivate,
+		PKEPrivate:    account.PKEPrivate,
+		SignPrivate:   account.SignPrivate,
 	}
 
 	return &userdata, nil
 }
 
-//Basic data structure for store file
-//Local file
+// Basic data structure for store file
+// Local file
 type NamespaceEntry struct {
 	IsOwner bool
-	FileID uuid.UUID
+	FileID  uuid.UUID
 
 	//Point to accessbox
-	AccessBoxUUID uuid.UUID
+	AccessBoxUUID   uuid.UUID
 	AccessBoxEncKey []byte
 	AccessBoxMACKey []byte
 
 	//Owner's ablity to manage the accessbox structure
-	AccessBoxStructureUUID uuid.UUID
+	AccessBoxStructureUUID   uuid.UUID
 	AccessBoxStructureEncKey []byte
 	AccessBoxStructureMACKey []byte
 }
 
 type AccessBox struct {
-	FileID uuid.UUID
+	FileID  uuid.UUID
 	EpochID uuid.UUID
-	
-	MetadataUUID uuid.UUID
+
+	MetadataUUID   uuid.UUID
 	MetadataEncKey []byte
 	MetadataMACKey []byte
 
 	FileRoot []byte
 
 	AccessBoxStructureUUID uuid.UUID
-	StatusUUID uuid.UUID
-	OwnerVerifyKeyName string
+	StatusUUID             uuid.UUID
+	OwnerVerifyKeyName     string
 }
 
 type FileStatusBody struct {
-	FileID uuid.UUID
-	EpochID uuid.UUID
+	FileID                  uuid.UUID
+	EpochID                 uuid.UUID
 	CurrentAccessCommitment []byte //Hashed AccessBox
-	OwnerVerifyKeyName string
+	OwnerVerifyKeyName      string
 }
 
 type FileStatus struct {
-	Body FileStatusBody
+	Body      FileStatusBody
 	Signature []byte
 }
 
-//Components of files
+// Components of files
 //
 // EpochID and Version are intentionally independent counters:
 //   - EpochID is the security/authorization generation. It changes only
@@ -692,10 +712,10 @@ type FileStatus struct {
 //     re-encrypting the same content under a new epoch is a physical
 //     migration, not a logical content mutation.
 type Metadata struct {
-	FileID uuid.UUID
-	EpochID uuid.UUID
-	Version uint64
-	TailUUID uuid.UUID
+	FileID     uuid.UUID
+	EpochID    uuid.UUID
+	Version    uint64
+	TailUUID   uuid.UUID
 	ChunkCount uint64
 }
 
@@ -981,7 +1001,7 @@ func (g *globalMutexGuard) ReleaseAll() {
 type noCCGuard struct{}
 
 func (noCCGuard) Acquire(_ lockmanager.ResourceID, _ lockmanager.LockMode) error { return nil }
-func (noCCGuard) ReleaseAll()                                                   {}
+func (noCCGuard) ReleaseAll()                                                    {}
 
 // newOperationGuard is the one call site every public operation uses to
 // obtain its lock guard. Swapping strategies never touches anything else
@@ -1003,23 +1023,23 @@ func newOperationGuard(txn lockmanager.TxnID) (lockGuardLike, error) {
 // ---------------------------------------------------------------------
 
 type Chunk struct {
-	FileID uuid.UUID
-	EpochID uuid.UUID
-	Index uint64
+	FileID   uuid.UUID
+	EpochID  uuid.UUID
+	Index    uint64
 	PrevUUID uuid.UUID
-	Content []byte
+	Content  []byte
 }
 
-//Bracnh boxes for every recipient
-type BranchBoxRecord struct{
-	BoxUUID uuid.UUID
+// Bracnh boxes for every recipient
+type BranchBoxRecord struct {
+	BoxUUID   uuid.UUID
 	BoxEncKey []byte
 	BoxMACKey []byte
 }
 
 type AccessBoxStructure struct {
-	FileID uuid.UUID
-	CurrentEpoch uuid.UUID
+	FileID         uuid.UUID
+	CurrentEpoch   uuid.UUID
 	RecipientBoxes map[string]BranchBoxRecord
 }
 
@@ -1058,7 +1078,7 @@ func canonicalNamespaceIdentity(username string, filename string) []byte {
 // object a given (username, filename) resolves to) and logical lock
 // identity (which saferLockManager resource protects it) can never diverge
 // -- there is exactly one canonical namespace identity, used for both.
-func getNameSpaceEntryUUID (username string, filename string,) (uuid.UUID, error) {
+func getNameSpaceEntryUUID(username string, filename string) (uuid.UUID, error) {
 	nameHash := userlib.Hash(
 		canonicalNamespaceIdentity(username, filename),
 	)
@@ -1066,59 +1086,59 @@ func getNameSpaceEntryUUID (username string, filename string,) (uuid.UUID, error
 	return uuid.FromBytes(nameHash[:16])
 }
 
-func deriveNamespaceEntryKeys (namespaceRoot []byte, filename string,) (encKey []byte, macKey []byte, err error,) {
+func deriveNamespaceEntryKeys(namespaceRoot []byte, filename string) (encKey []byte, macKey []byte, err error) {
 	if len(namespaceRoot) != symmetricKeySize {
 		return nil, nil, errors.New("Invalid namespace root")
 	}
 
 	encResult, err := userlib.HashKDF(
 		namespaceRoot,
-		[]byte("namespace-entry-enc:" + filename),
+		[]byte("namespace-entry-enc:"+filename),
 	)
 
 	if err != nil {
-        return nil, nil, err
-    }
+		return nil, nil, err
+	}
 
 	macResult, err := userlib.HashKDF(
 		namespaceRoot,
-		[]byte("namespace-entry-mac:" + filename),
+		[]byte("namespace-entry-mac:"+filename),
 	)
 
 	if err != nil {
-        return nil, nil, err
-    }
+		return nil, nil, err
+	}
 
 	return encResult[:16], macResult[:16], nil
 }
 
-func deriveChunkKeys (fileRoot []byte, chunkUUID uuid.UUID,) (encKey []byte, macKey []byte, err error,) {
+func deriveChunkKeys(fileRoot []byte, chunkUUID uuid.UUID) (encKey []byte, macKey []byte, err error) {
 	if len(fileRoot) != symmetricKeySize {
 		return nil, nil, errors.New("invalid file root")
 	}
 
 	encResult, err := userlib.HashKDF(
 		fileRoot,
-		[]byte("file-chunk-enc:" + chunkUUID.String()),
+		[]byte("file-chunk-enc:"+chunkUUID.String()),
 	)
 
 	if err != nil {
-        return nil, nil, err
-    }
+		return nil, nil, err
+	}
 
 	macResult, err := userlib.HashKDF(
-        fileRoot,
-        []byte("file-chunk-mac:"+chunkUUID.String()),
-    )
-    if err != nil {
-        return nil, nil, err
-    }
+		fileRoot,
+		[]byte("file-chunk-mac:"+chunkUUID.String()),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
 
-    return encResult[:16], macResult[:16], nil
+	return encResult[:16], macResult[:16], nil
 }
 
-//General message for mac generator
-func datastoreObjectMACMessage (
+// General message for mac generator
+func datastoreObjectMACMessage(
 	objectType string,
 	objectUUID uuid.UUID,
 	ciphertext []byte,
@@ -1130,7 +1150,7 @@ func datastoreObjectMACMessage (
 	message := make(
 		[]byte,
 		0,
-		len(prefix) + len(ciphertext),
+		len(prefix)+len(ciphertext),
 	)
 
 	message = append(message, prefix...)
@@ -1139,8 +1159,8 @@ func datastoreObjectMACMessage (
 	return message
 }
 
-//General emac generator for MD chunk accessbox namespaceentry accessboxstructure
-func protectDatastoreObject (
+// General emac generator for MD chunk accessbox namespaceentry accessboxstructure
+func protectDatastoreObject(
 	objectType string,
 	objectUUID uuid.UUID,
 	object interface{},
@@ -1161,8 +1181,8 @@ func protectDatastoreObject (
 
 	plaintext, err := json.Marshal(object)
 	if err != nil {
-        return nil, err
-    }
+		return nil, err
+	}
 
 	iv := userlib.RandomBytes(
 		userlib.AESBlockSizeBytes,
@@ -1185,55 +1205,55 @@ func protectDatastoreObject (
 	)
 
 	if err != nil {
-        return nil, err
-    }
+		return nil, err
+	}
 
 	envelope := AuthenticatedEnvelope{
 		Ciphertext: ciphertext,
-		MAC: mac,
+		MAC:        mac,
 	}
 
 	return json.Marshal(envelope)
 }
 
 const (
-    namespaceEntryObjectType     = "namespace-entry"
-    accessBoxObjectType          = "access-box"
-    accessBoxStructureObjectType = "access-box-structure"
-    metadataObjectType           = "metadata"
-    chunkObjectType              = "chunk"
+	namespaceEntryObjectType     = "namespace-entry"
+	accessBoxObjectType          = "access-box"
+	accessBoxStructureObjectType = "access-box-structure"
+	metadataObjectType           = "metadata"
+	chunkObjectType              = "chunk"
 )
 
-func getAccessBoxCommitment (
+func getAccessBoxCommitment(
 	accessBox AccessBox,
 ) ([]byte, error) {
 	accessBoxBytes, err := json.Marshal(accessBox)
 	if err != nil {
-        return nil, err
-    }
+		return nil, err
+	}
 
-    return userlib.Hash(accessBoxBytes), nil
+	return userlib.Hash(accessBoxBytes), nil
 }
 
-func getFileStatusSignatureMessage (
+func getFileStatusSignatureMessage(
 	statusUUID uuid.UUID,
 	body FileStatusBody,
 ) ([]byte, error) {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-        return nil, err
-    }
+		return nil, err
+	}
 
-    prefix := []byte (
+	prefix := []byte(
 		"file-status-signature:" +
-		statusUUID.String() +
-		":",
+			statusUUID.String() +
+			":",
 	)
 
 	message := make(
 		[]byte,
 		0,
-		len(prefix) + len(bodyBytes),
+		len(prefix)+len(bodyBytes),
 	)
 
 	message = append(message, prefix...)
@@ -1242,7 +1262,7 @@ func getFileStatusSignatureMessage (
 	return message, nil
 }
 
-func createFileStatus (
+func createFileStatus(
 	userdata *User,
 	statusUUID uuid.UUID,
 	accessBox AccessBox,
@@ -1251,15 +1271,15 @@ func createFileStatus (
 
 	commitment, err := getAccessBoxCommitment(accessBox)
 	if err != nil {
-        return emptyStatus, err
-    }
+		return emptyStatus, err
+	}
 
 	//Create the body for file status based on the accessbox
 	body := FileStatusBody{
-		FileID: accessBox.FileID,
-		EpochID: accessBox.EpochID,
+		FileID:                  accessBox.FileID,
+		EpochID:                 accessBox.EpochID,
 		CurrentAccessCommitment: commitment,
-		OwnerVerifyKeyName: accessBox.OwnerVerifyKeyName,
+		OwnerVerifyKeyName:      accessBox.OwnerVerifyKeyName,
 	}
 
 	signatureMessage, err := getFileStatusSignatureMessage(
@@ -1268,8 +1288,8 @@ func createFileStatus (
 	)
 
 	if err != nil {
-        return emptyStatus, err
-    }
+		return emptyStatus, err
+	}
 
 	signature, err := userlib.DSSign(
 		userdata.SignPrivate,
@@ -1277,18 +1297,18 @@ func createFileStatus (
 	)
 
 	if err != nil {
-        return emptyStatus, err
-    }
+		return emptyStatus, err
+	}
 
 	status := FileStatus{
-		Body: body,
+		Body:      body,
 		Signature: signature,
 	}
 
 	return status, nil
 }
 
-//If the file hasnt been create yet, store the new file
+// If the file hasnt been create yet, store the new file
 // storeNewFileLocked creates a brand-new logical file and publishes it
 // under fileID. It assumes the caller (StoreFile) already holds
 // X(namespace(userdata.Username, filename)) and X(file(fileID)) for the
@@ -1310,17 +1330,17 @@ func (userdata *User) storeNewFileLocked(
 	)
 
 	if err != nil {
-    	return err
+		return err
 	}
 
 	namespaceEncKey, namespaceMACKey, err :=
-	deriveNamespaceEntryKeys(
-		userdata.NamespaceRoot,
-		filename,
-	)
+		deriveNamespaceEntryKeys(
+			userdata.NamespaceRoot,
+			filename,
+		)
 
 	if err != nil {
-    	return err
+		return err
 	}
 
 	//Generate the remaining random ids (fileID is supplied by the caller):
@@ -1346,11 +1366,11 @@ func (userdata *User) storeNewFileLocked(
 
 	//Create the base chunk
 	chunk := Chunk{
-		FileID: fileID,
-		EpochID: epochID,
-		Index: 0,
+		FileID:   fileID,
+		EpochID:  epochID,
+		Index:    0,
 		PrevUUID: uuid.Nil,
-		Content: content,
+		Content:  content,
 	}
 
 	chunkEncKey, chunkMACKey, err := deriveChunkKeys(
@@ -1375,37 +1395,37 @@ func (userdata *User) storeNewFileLocked(
 	}
 
 	metadata := Metadata{
-		FileID: fileID,
-		EpochID: epochID,
-		Version: 1,
-		TailUUID: baseChunkUUID,
+		FileID:     fileID,
+		EpochID:    epochID,
+		Version:    1,
+		TailUUID:   baseChunkUUID,
 		ChunkCount: 1,
 	}
 
 	protectedMetadata, err := protectDatastoreObject(
-    	metadataObjectType,
-    	metadataUUID,
-    	metadata,
-    	metadataEncKey,
-    	metadataMACKey,
+		metadataObjectType,
+		metadataUUID,
+		metadata,
+		metadataEncKey,
+		metadataMACKey,
 	)
 	if err != nil {
-    	return err
+		return err
 	}
 
 	accessBox := AccessBox{
-		FileID: fileID,
+		FileID:  fileID,
 		EpochID: epochID,
 
-		MetadataUUID: metadataUUID,
+		MetadataUUID:   metadataUUID,
 		MetadataEncKey: metadataEncKey,
 		MetadataMACKey: metadataMACKey,
 
 		FileRoot: fileRoot,
 
 		AccessBoxStructureUUID: structureUUID,
-		StatusUUID: statusUUID,
-		OwnerVerifyKeyName: getVerifyKeyName(userdata.Username),
+		StatusUUID:             statusUUID,
+		OwnerVerifyKeyName:     getVerifyKeyName(userdata.Username),
 	}
 
 	protectedAccessBox, err := protectDatastoreObject(
@@ -1416,26 +1436,26 @@ func (userdata *User) storeNewFileLocked(
 		ownerAccessBoxMACKey,
 	)
 	if err != nil {
-    	return err
+		return err
 	}
 
 	fileStatus, err := createFileStatus(
-		userdata, //v.k.
+		userdata,   //v.k.
 		statusUUID, //For generating d.s. message
-		accessBox, //For fileid epochid commitment 
+		accessBox,  //For fileid epochid commitment
 	)
 	if err != nil {
-    	return err
+		return err
 	}
 
 	fileStatusBytes, err := json.Marshal(fileStatus)
 	if err != nil {
-    	return err
+		return err
 	}
 
-	structure := AccessBoxStructure {
-		FileID: fileID,
-		CurrentEpoch: epochID,
+	structure := AccessBoxStructure{
+		FileID:         fileID,
+		CurrentEpoch:   epochID,
 		RecipientBoxes: make(map[string]BranchBoxRecord),
 	}
 
@@ -1448,17 +1468,17 @@ func (userdata *User) storeNewFileLocked(
 	)
 
 	if err != nil {
-    	return err
+		return err
 	}
 
 	namespaceEntry := NamespaceEntry{
-		IsOwner: true,
-		FileID: fileID,
-		AccessBoxUUID: ownerAccessBoxUUID,
+		IsOwner:         true,
+		FileID:          fileID,
+		AccessBoxUUID:   ownerAccessBoxUUID,
 		AccessBoxEncKey: ownerAccessBoxEncKey,
 		AccessBoxMACKey: ownerAccessBoxMACKey,
 
-		AccessBoxStructureUUID: structureUUID,
+		AccessBoxStructureUUID:   structureUUID,
 		AccessBoxStructureEncKey: structureEncKey,
 		AccessBoxStructureMACKey: structureMACKey,
 	}
@@ -1472,7 +1492,7 @@ func (userdata *User) storeNewFileLocked(
 	)
 
 	if err != nil {
-    	return err
+		return err
 	}
 
 	// Commit point: a new file is six objects -- chunk, metadata, access
@@ -1530,7 +1550,7 @@ func (userdata *User) storeNewFileLocked(
 	})
 }
 
-/** 
+/**
 If the file already exists, we rewrite the file
 **/
 
@@ -1547,61 +1567,61 @@ func overwriteExistingFileLocked(
 	content []byte,
 ) error {
 	metadata, err := loadMetadata(ctx, accessBox)
-    if err != nil {
-        return err
-    }
+	if err != nil {
+		return err
+	}
 
 	fireConcurrencyTestHook("overwrite:metadata-loaded:" + accessBox.FileID.String())
 
 	_, oldChunkUUIDs, err :=
-        loadFileContentAndChunkUUIDs(ctx, 
-            accessBox,
-            metadata,
-        )
-    if err != nil {
-        return err
-    }
+		loadFileContentAndChunkUUIDs(ctx,
+			accessBox,
+			metadata,
+		)
+	if err != nil {
+		return err
+	}
 	oldChunkSet := make(map[uuid.UUID]bool)
 
-    for _, oldChunkUUID := range oldChunkUUIDs {
-        oldChunkSet[oldChunkUUID] = true
-    }
+	for _, oldChunkUUID := range oldChunkUUIDs {
+		oldChunkSet[oldChunkUUID] = true
+	}
 	var newBaseChunkUUID uuid.UUID
 
-    for {
-        newBaseChunkUUID = uuid.New()
+	for {
+		newBaseChunkUUID = uuid.New()
 
-        if !oldChunkSet[newBaseChunkUUID] {
-            break
-        }
-    }
+		if !oldChunkSet[newBaseChunkUUID] {
+			break
+		}
+	}
 	newChunk := Chunk{
-        FileID:   accessBox.FileID,
-        EpochID:  accessBox.EpochID,
-        Index:    0,
-        PrevUUID: uuid.Nil,
-        Content:  content,
-    }
+		FileID:   accessBox.FileID,
+		EpochID:  accessBox.EpochID,
+		Index:    0,
+		PrevUUID: uuid.Nil,
+		Content:  content,
+	}
 
-    newChunkEncKey, newChunkMACKey, err :=
-        deriveChunkKeys(
-            accessBox.FileRoot,
-            newBaseChunkUUID,
-        )
-    if err != nil {
-        return err
-    }
+	newChunkEncKey, newChunkMACKey, err :=
+		deriveChunkKeys(
+			accessBox.FileRoot,
+			newBaseChunkUUID,
+		)
+	if err != nil {
+		return err
+	}
 
-    protectedNewChunk, err := protectDatastoreObject(
-        chunkObjectType,
-        newBaseChunkUUID,
-        newChunk,
-        newChunkEncKey,
-        newChunkMACKey,
-    )
-    if err != nil {
-        return err
-    }
+	protectedNewChunk, err := protectDatastoreObject(
+		chunkObjectType,
+		newBaseChunkUUID,
+		newChunk,
+		newChunkEncKey,
+		newChunkMACKey,
+	)
+	if err != nil {
+		return err
+	}
 
 	// An overwrite always replaces the logical content, so the content
 	// version advances exactly once, even though ChunkCount resets to 1.
@@ -1611,24 +1631,24 @@ func overwriteExistingFileLocked(
 	}
 
 	newMetadata := Metadata{
-        FileID:     accessBox.FileID,
-        EpochID:    accessBox.EpochID,
-        Version:    newVersion,
-        TailUUID:   newBaseChunkUUID,
-        ChunkCount: 1,
-    }
+		FileID:     accessBox.FileID,
+		EpochID:    accessBox.EpochID,
+		Version:    newVersion,
+		TailUUID:   newBaseChunkUUID,
+		ChunkCount: 1,
+	}
 
-    protectedNewMetadata, err :=
-        protectDatastoreObject(
-            metadataObjectType,
-            accessBox.MetadataUUID,
-            newMetadata,
-            accessBox.MetadataEncKey,
-            accessBox.MetadataMACKey,
-        )
-    if err != nil {
-        return err
-    }
+	protectedNewMetadata, err :=
+		protectDatastoreObject(
+			metadataObjectType,
+			accessBox.MetadataUUID,
+			newMetadata,
+			accessBox.MetadataEncKey,
+			accessBox.MetadataMACKey,
+		)
+	if err != nil {
+		return err
+	}
 
 	// Commit point: an overwrite publishes new content and reclaims the
 	// old chunks. Metadata is the switch -- it names the new chunk chain
@@ -1701,8 +1721,8 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 	)
 
 	if err != nil {
-        return err
-    }
+		return err
+	}
 
 	_, exists, err := datastoreGet(ctx, nameUUID)
 
@@ -1720,6 +1740,7 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
 			return err
 		}
+		ctx = withFenceGrants(ctx, guard) // every lock is held; the commit must prove them
 
 		accessBox, err := validateFileAccessUnderLock(ctx, namespaceEntry)
 		if err != nil {
@@ -1735,6 +1756,7 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
 		return err
 	}
+	ctx = withFenceGrants(ctx, guard) // every lock is held; the commit must prove them
 
 	return userdata.storeNewFileLocked(ctx, filename, content, fileID)
 }
@@ -1780,6 +1802,7 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
 		return err
 	}
+	ctx = withFenceGrants(ctx, guard) // every lock is held; the commit must prove them
 
 	accessBox, err := validateFileAccessUnderLock(ctx, namespaceEntry)
 	if err != nil {
@@ -1807,11 +1830,11 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 	newChunkUUID := uuid.New()
 
 	newChunk := Chunk{
-		FileID: accessBox.FileID,
-		EpochID: accessBox.EpochID,
-		Index: metadata.ChunkCount,
+		FileID:   accessBox.FileID,
+		EpochID:  accessBox.EpochID,
+		Index:    metadata.ChunkCount,
 		PrevUUID: metadata.TailUUID,
-		Content: content,
+		Content:  content,
 	}
 
 	newChunkEncKey, newChunkMACKey, err := deriveChunkKeys(
@@ -1820,20 +1843,20 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 	)
 
 	if err != nil {
-        return err
-    }
+		return err
+	}
 
-    protectedNewChunk, err :=
-        protectDatastoreObject(
-            chunkObjectType,
-            newChunkUUID,
-            newChunk,
-            newChunkEncKey,
-            newChunkMACKey,
-        )
-    if err != nil {
-        return err
-    }
+	protectedNewChunk, err :=
+		protectDatastoreObject(
+			chunkObjectType,
+			newChunkUUID,
+			newChunk,
+			newChunkEncKey,
+			newChunkMACKey,
+		)
+	if err != nil {
+		return err
+	}
 
 	// Phase 4: safe. metadata was loaded above only after File X was
 	// granted, and File X is held for the rest of this function (released
@@ -1846,24 +1869,24 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 	}
 
 	updatedMetadata := Metadata{
-        FileID:     metadata.FileID,
-        EpochID:    metadata.EpochID,
-        Version:    newVersion,
-        TailUUID:   newChunkUUID,
-        ChunkCount: metadata.ChunkCount + 1,
-    }
+		FileID:     metadata.FileID,
+		EpochID:    metadata.EpochID,
+		Version:    newVersion,
+		TailUUID:   newChunkUUID,
+		ChunkCount: metadata.ChunkCount + 1,
+	}
 
-    protectedUpdatedMetadata, err :=
-        protectDatastoreObject(
-            metadataObjectType,
-            accessBox.MetadataUUID,
-            updatedMetadata,
-            accessBox.MetadataEncKey,
-            accessBox.MetadataMACKey,
-        )
-    if err != nil {
-        return err
-    }
+	protectedUpdatedMetadata, err :=
+		protectDatastoreObject(
+			metadataObjectType,
+			accessBox.MetadataUUID,
+			updatedMetadata,
+			accessBox.MetadataEncKey,
+			accessBox.MetadataMACKey,
+		)
+	if err != nil {
+		return err
+	}
 
 	// Commit point: an append is the new chunk plus the metadata that
 	// makes it part of the file. Committing metadata without the chunk
@@ -1885,9 +1908,11 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 	})
 }
 
-/**
+/*
+*
 Helper func for loadFile
-**/
+*
+*/
 func loadDatastoreObject(
 	ctx context.Context,
 	objectType string,
@@ -1897,67 +1922,67 @@ func loadDatastoreObject(
 	destination interface{},
 ) error {
 	if objectType == "" {
-        return errors.New("object type cannot be empty")
-    }
+		return errors.New("object type cannot be empty")
+	}
 
-    if objectUUID == uuid.Nil {
-        return errors.New("object UUID cannot be nil")
-    }
+	if objectUUID == uuid.Nil {
+		return errors.New("object UUID cannot be nil")
+	}
 
-    if len(encKey) != symmetricKeySize ||
-        len(macKey) != symmetricKeySize {
-        return errors.New("invalid object keys")
-    }
+	if len(encKey) != symmetricKeySize ||
+		len(macKey) != symmetricKeySize {
+		return errors.New("invalid object keys")
+	}
 
-    envelopeBytes, exists, err := datastoreGet(ctx, objectUUID)
-    if err != nil {
-        return err
-    }
-    if !exists {
-        return errors.New("required datastore object is missing")
-    }
+	envelopeBytes, exists, err := datastoreGet(ctx, objectUUID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("required datastore object is missing")
+	}
 
-    var envelope AuthenticatedEnvelope
-    err = json.Unmarshal(envelopeBytes, &envelope)
-    if err != nil {
-        return errors.New("invalid datastore envelope")
-    }
+	var envelope AuthenticatedEnvelope
+	err = json.Unmarshal(envelopeBytes, &envelope)
+	if err != nil {
+		return errors.New("invalid datastore envelope")
+	}
 
-    if len(envelope.MAC) != userlib.HashSizeBytes {
-        return errors.New("invalid datastore MAC length")
-    }
+	if len(envelope.MAC) != userlib.HashSizeBytes {
+		return errors.New("invalid datastore MAC length")
+	}
 
-    expectedMAC, err := userlib.HMACEval(
-        macKey,
-        datastoreObjectMACMessage(
-            objectType,
-            objectUUID,
-            envelope.Ciphertext,
-        ),
-    )
-    if err != nil {
-        return err
-    }
+	expectedMAC, err := userlib.HMACEval(
+		macKey,
+		datastoreObjectMACMessage(
+			objectType,
+			objectUUID,
+			envelope.Ciphertext,
+		),
+	)
+	if err != nil {
+		return err
+	}
 
-    if !userlib.HMACEqual(expectedMAC, envelope.MAC) {
-        return errors.New("datastore object authentication failed")
-    }
+	if !userlib.HMACEqual(expectedMAC, envelope.MAC) {
+		return errors.New("datastore object authentication failed")
+	}
 
-    if len(envelope.Ciphertext) < userlib.AESBlockSizeBytes {
-        return errors.New("datastore ciphertext is too short")
-    }
+	if len(envelope.Ciphertext) < userlib.AESBlockSizeBytes {
+		return errors.New("datastore ciphertext is too short")
+	}
 
-    plaintext := userlib.SymDec(
-        encKey,
-        envelope.Ciphertext,
-    )
+	plaintext := userlib.SymDec(
+		encKey,
+		envelope.Ciphertext,
+	)
 
-    err = json.Unmarshal(plaintext, destination)
-    if err != nil {
-        return errors.New("invalid datastore object plaintext")
-    }
+	err = json.Unmarshal(plaintext, destination)
+	if err != nil {
+		return errors.New("invalid datastore object plaintext")
+	}
 
-    return nil
+	return nil
 }
 
 func verifyFileStatus(
@@ -1968,7 +1993,7 @@ func verifyFileStatus(
 		return errors.New("invalid status uuid")
 	}
 
-	statusBytes, exists, err := datastoreGet(ctx, 
+	statusBytes, exists, err := datastoreGet(ctx,
 		accessBox.StatusUUID,
 	)
 
@@ -1977,17 +2002,17 @@ func verifyFileStatus(
 	}
 
 	if !exists {
-        return errors.New("file status is missing")
-    }
+		return errors.New("file status is missing")
+	}
 
 	//Unmarshal the statusBytes
 	var status FileStatus
-    err = json.Unmarshal(statusBytes, &status)
-    if err != nil {
-        return errors.New("invalid file status")
-    }
+	err = json.Unmarshal(statusBytes, &status)
+	if err != nil {
+		return errors.New("invalid file status")
+	}
 
-	verifyKey, exists, err := keystoreGet(ctx, 
+	verifyKey, exists, err := keystoreGet(ctx,
 		accessBox.OwnerVerifyKeyName,
 	)
 
@@ -1996,8 +2021,8 @@ func verifyFileStatus(
 	}
 
 	if !exists {
-        return errors.New("owner verification key is missing")
-    }
+		return errors.New("owner verification key is missing")
+	}
 
 	if verifyKey.KeyType != "DS" {
 		return errors.New("Invalid owner verification key")
@@ -2009,8 +2034,8 @@ func verifyFileStatus(
 	)
 
 	if err != nil {
-        return err
-    }
+		return err
+	}
 
 	err = userlib.DSVerify(
 		verifyKey,
@@ -2018,17 +2043,17 @@ func verifyFileStatus(
 		status.Signature,
 	)
 
-	if err != nil{
+	if err != nil {
 		return errors.New("invalid signature")
 	}
 
-	 if status.Body.FileID != accessBox.FileID {
-        return errors.New("file status FileID mismatch")
-    }
+	if status.Body.FileID != accessBox.FileID {
+		return errors.New("file status FileID mismatch")
+	}
 
-    if status.Body.EpochID != accessBox.EpochID {
-        return errors.New("file status epoch mismatch")
-    }
+	if status.Body.EpochID != accessBox.EpochID {
+		return errors.New("file status epoch mismatch")
+	}
 
 	if status.Body.OwnerVerifyKeyName != accessBox.OwnerVerifyKeyName {
 		return errors.New("file status owner mismatch")
@@ -2037,17 +2062,17 @@ func verifyFileStatus(
 	expectedCommitment, err := getAccessBoxCommitment(accessBox)
 
 	if err != nil {
-        return err
-    }
+		return err
+	}
 
 	if !userlib.HMACEqual(
-        expectedCommitment,
-        status.Body.CurrentAccessCommitment,
-    ) {
-        return errors.New("stale access box")
-    }
+		expectedCommitment,
+		status.Body.CurrentAccessCommitment,
+	) {
+		return errors.New("stale access box")
+	}
 
-    return nil
+	return nil
 }
 
 // loadNamespaceEntry loads and authenticates userdata's NamespaceEntry for
@@ -2091,7 +2116,7 @@ func loadNamespaceEntry(ctx context.Context, userdata *User, filename string) (N
 	var namespaceEntry NamespaceEntry
 
 	//Get the namespaceEntry
-	err = loadDatastoreObject(ctx, 
+	err = loadDatastoreObject(ctx,
 		namespaceEntryObjectType,
 		nameUUID,
 		namespaceEncKey,
@@ -2137,7 +2162,7 @@ func validateFileAccessUnderLock(ctx context.Context, namespaceEntry NamespaceEn
 	var emptyAccessBox AccessBox
 	var accessBox AccessBox
 
-	err := loadDatastoreObject(ctx, 
+	err := loadDatastoreObject(ctx,
 		accessBoxObjectType,
 		namespaceEntry.AccessBoxUUID,
 		namespaceEntry.AccessBoxEncKey,
@@ -2207,7 +2232,7 @@ func validateInvitationAccessUnderLock(ctx context.Context, payload InvitationPa
 	var emptyAccessBox AccessBox
 	var accessBox AccessBox
 
-	err := loadDatastoreObject(ctx, 
+	err := loadDatastoreObject(ctx,
 		accessBoxObjectType,
 		payload.AccessBoxUUID,
 		payload.AccessBoxEncKey,
@@ -2340,7 +2365,7 @@ func CheckAuthorizationInvariantsForBenchmark(owner *User, filename string, expe
 
 	for recipient, record := range structure.RecipientBoxes {
 		var branchBox AccessBox
-		err := loadDatastoreObject(ctx, 
+		err := loadDatastoreObject(ctx,
 			accessBoxObjectType,
 			record.BoxUUID,
 			record.BoxEncKey,
@@ -2360,57 +2385,57 @@ func CheckAuthorizationInvariantsForBenchmark(owner *User, filename string, expe
 
 // ---------------------------------------------------------------------
 
-//load metadata from datastore
-func loadMetadata (
+// load metadata from datastore
+func loadMetadata(
 	ctx context.Context,
 	accessBox AccessBox,
 ) (Metadata, error) {
 	var metadata Metadata
 
-    err := loadDatastoreObject(ctx, 
-        metadataObjectType,
-        accessBox.MetadataUUID,
-        accessBox.MetadataEncKey,
-        accessBox.MetadataMACKey,
-        &metadata,
-    )
-    if err != nil {
-        return Metadata{}, err
-    }
+	err := loadDatastoreObject(ctx,
+		metadataObjectType,
+		accessBox.MetadataUUID,
+		accessBox.MetadataEncKey,
+		accessBox.MetadataMACKey,
+		&metadata,
+	)
+	if err != nil {
+		return Metadata{}, err
+	}
 
-    if metadata.FileID != accessBox.FileID {
-        return Metadata{},
-            errors.New("metadata FileID mismatch")
-    }
+	if metadata.FileID != accessBox.FileID {
+		return Metadata{},
+			errors.New("metadata FileID mismatch")
+	}
 
-    if metadata.EpochID != accessBox.EpochID {
-        return Metadata{},
-            errors.New("metadata epoch mismatch")
-    }
+	if metadata.EpochID != accessBox.EpochID {
+		return Metadata{},
+			errors.New("metadata epoch mismatch")
+	}
 
-    if metadata.ChunkCount == 0 {
-        return Metadata{},
-            errors.New("metadata has zero chunks")
-    }
+	if metadata.ChunkCount == 0 {
+		return Metadata{},
+			errors.New("metadata has zero chunks")
+	}
 
-    // Every SAFER-CC V1 metadata object is created with Version >= 1
-    // (storeNewFile sets 1; AppendToFile/overwrite advance it via
-    // nextMetadataVersion; RevokeAccess preserves it unchanged). There are
-    // no legacy pre-V1 fixtures in this repository that would deserialize
-    // with Version == 0, so this is enforced strictly rather than
-    // silently normalized -- Version == 0 always indicates corrupted or
-    // forged metadata.
-    if metadata.Version == 0 {
-        return Metadata{},
-            errors.New("metadata has invalid content version")
-    }
+	// Every SAFER-CC V1 metadata object is created with Version >= 1
+	// (storeNewFile sets 1; AppendToFile/overwrite advance it via
+	// nextMetadataVersion; RevokeAccess preserves it unchanged). There are
+	// no legacy pre-V1 fixtures in this repository that would deserialize
+	// with Version == 0, so this is enforced strictly rather than
+	// silently normalized -- Version == 0 always indicates corrupted or
+	// forged metadata.
+	if metadata.Version == 0 {
+		return Metadata{},
+			errors.New("metadata has invalid content version")
+	}
 
-    if metadata.TailUUID == uuid.Nil {
-        return Metadata{},
-            errors.New("metadata tail is nil")
-    }
+	if metadata.TailUUID == uuid.Nil {
+		return Metadata{},
+			errors.New("metadata tail is nil")
+	}
 
-    return metadata, nil
+	return metadata, nil
 }
 
 func loadFileContentAndChunkUUIDs(
@@ -2426,99 +2451,95 @@ func loadFileContentAndChunkUUIDs(
 	seen := make(map[uuid.UUID]bool)
 	reversedContents := make([][]byte, 0)
 
-	for remaining := metadat.ChunkCount;
-		remaining > 0;
-		remaining-- {
-			if currentUUID == uuid.Nil {
-				return nil, nil, errors.New("chunk chain ended early")
-			}
-
-			if seen[currentUUID] {
-				return nil, nil, errors.New("chunk chain contains a cycle")
-			}
-
-			seen[currentUUID] = true
-
-			chunkEncKey, chunkMACKey, err := deriveChunkKeys(
-				accessBox.FileRoot,
-				currentUUID,
-			)
-
-			if err != nil {
-            	return nil, nil, err
-        	}
-
-        	var chunk Chunk
-
-        	err = loadDatastoreObject(ctx, 
-            	chunkObjectType,
-            	currentUUID,
-            	chunkEncKey,
-            	chunkMACKey,
-            	&chunk,
-        	)
-        	if err != nil {
-            	return nil, nil, err
-        	}
-
-			expectedIndex := remaining - 1
-
-        	if chunk.FileID != accessBox.FileID {
-            	return nil, nil,
-                	errors.New("chunk FileID mismatch")
-        	}
-
-        	if chunk.EpochID != accessBox.EpochID {
-            	return nil, nil,
-                	errors.New("chunk epoch mismatch")
-        	}
-
-        	if chunk.Index != expectedIndex {
-            	return nil, nil,
-                	errors.New("chunk index mismatch")
-        	}
-
-        	if expectedIndex == 0 {
-            	if chunk.PrevUUID != uuid.Nil {
-                	return nil, nil,
-                    	errors.New("base chunk predecessor is not nil")
-            	}
-        	} else {
-            	if chunk.PrevUUID == uuid.Nil {
-                	return nil, nil,
-                    	errors.New("chunk chain is truncated")
-            	}
-        	}
-
-			reversedContents = append(
-            	reversedContents,
-            	chunk.Content,
-        	)
-
-        	chunkUUIDs = append(
-            	chunkUUIDs,
-            	currentUUID,
-        	)
-
-        	currentUUID = chunk.PrevUUID
+	for remaining := metadat.ChunkCount; remaining > 0; remaining-- {
+		if currentUUID == uuid.Nil {
+			return nil, nil, errors.New("chunk chain ended early")
 		}
 
-		if currentUUID != uuid.Nil {
-        	return nil, nil,
-            	errors.New("chunk chain has extra predecessor")
-    	}
-		content = make([]byte, 0)
+		if seen[currentUUID] {
+			return nil, nil, errors.New("chunk chain contains a cycle")
+		}
 
-    	for index := len(reversedContents) - 1;
-        	index >= 0;
-        	index-- {
-        	content = append(
-            	content,
-            	reversedContents[index]...,
-        	)
-    	}
+		seen[currentUUID] = true
 
-    return content, chunkUUIDs, nil
+		chunkEncKey, chunkMACKey, err := deriveChunkKeys(
+			accessBox.FileRoot,
+			currentUUID,
+		)
+
+		if err != nil {
+			return nil, nil, err
+		}
+
+		var chunk Chunk
+
+		err = loadDatastoreObject(ctx,
+			chunkObjectType,
+			currentUUID,
+			chunkEncKey,
+			chunkMACKey,
+			&chunk,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		expectedIndex := remaining - 1
+
+		if chunk.FileID != accessBox.FileID {
+			return nil, nil,
+				errors.New("chunk FileID mismatch")
+		}
+
+		if chunk.EpochID != accessBox.EpochID {
+			return nil, nil,
+				errors.New("chunk epoch mismatch")
+		}
+
+		if chunk.Index != expectedIndex {
+			return nil, nil,
+				errors.New("chunk index mismatch")
+		}
+
+		if expectedIndex == 0 {
+			if chunk.PrevUUID != uuid.Nil {
+				return nil, nil,
+					errors.New("base chunk predecessor is not nil")
+			}
+		} else {
+			if chunk.PrevUUID == uuid.Nil {
+				return nil, nil,
+					errors.New("chunk chain is truncated")
+			}
+		}
+
+		reversedContents = append(
+			reversedContents,
+			chunk.Content,
+		)
+
+		chunkUUIDs = append(
+			chunkUUIDs,
+			currentUUID,
+		)
+
+		currentUUID = chunk.PrevUUID
+	}
+
+	if currentUUID != uuid.Nil {
+		return nil, nil,
+			errors.New("chunk chain has extra predecessor")
+	}
+	content = make([]byte, 0)
+
+	for index := len(reversedContents) - 1; index >= 0; index-- {
+		content = append(
+			content,
+			reversedContents[index]...,
+		)
+	}
+
+	return content, chunkUUIDs, nil
 }
 
 // LoadFile is the strict-2PL transaction boundary for reads. Lock
@@ -2577,7 +2598,7 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 		return nil, err
 	}
 
-	content, _, err = loadFileContentAndChunkUUIDs(ctx, 
+	content, _, err = loadFileContentAndChunkUUIDs(ctx,
 		accessBox,
 		metadata,
 	)
@@ -2589,29 +2610,29 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 	return content, nil
 }
 
-//Basic datastructure
+// Basic datastructure
 type InvitationPayload struct {
-	SenderIdentity []byte
+	SenderIdentity    []byte
 	RecipientIdentity []byte
 
 	FileID uuid.UUID
 
-	AccessBoxUUID uuid.UUID
+	AccessBoxUUID   uuid.UUID
 	AccessBoxEncKey []byte
 	AccessBoxMACKey []byte
 }
 
 type Invitation struct {
 	WrappedRoot []byte
-	Ciphertext []byte //enc payload
-	MAC []byte
-	Signature []byte
+	Ciphertext  []byte //enc payload
+	MAC         []byte
+	Signature   []byte
 }
 
 type InvitationSignedFields struct {
 	WrappedRoot []byte
-	Ciphertext []byte
-	MAC []byte
+	Ciphertext  []byte
+	MAC         []byte
 }
 
 func getInvitationIdentity(
@@ -2631,240 +2652,240 @@ func deriveInvitationKeys(
 	err error,
 ) {
 	if len(inviteRoot) != symmetricKeySize {
-        return nil, nil,
-            errors.New("invalid invitation root")
-    }
+		return nil, nil,
+			errors.New("invalid invitation root")
+	}
 
-    encResult, err := userlib.HashKDF(
-        inviteRoot,
-        []byte(
-            "invitation-enc:" +
-                invitationUUID.String(),
-        ),
-    )
-    if err != nil {
-        return nil, nil, err
-    }
+	encResult, err := userlib.HashKDF(
+		inviteRoot,
+		[]byte(
+			"invitation-enc:"+
+				invitationUUID.String(),
+		),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
 
-    macResult, err := userlib.HashKDF(
-        inviteRoot,
-        []byte(
-            "invitation-mac:" +
-                invitationUUID.String(),
-        ),
-    )
-    if err != nil {
-        return nil, nil, err
-    }
+	macResult, err := userlib.HashKDF(
+		inviteRoot,
+		[]byte(
+			"invitation-mac:"+
+				invitationUUID.String(),
+		),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
 
-    return encResult[:16], macResult[:16], nil
+	return encResult[:16], macResult[:16], nil
 }
 
-//Get the invitation for generate mac message
+// Get the invitation for generate mac message
 func getInvitationMACMessage(
 	invitationUUID uuid.UUID,
 	ciphertext []byte,
 ) []byte {
 	prefix := []byte(
-        "invitation-ciphertext:" +
-            invitationUUID.String() +
-            ":",
-    )
+		"invitation-ciphertext:" +
+			invitationUUID.String() +
+			":",
+	)
 
-    message := make(
-        []byte,
-        0,
-        len(prefix)+len(ciphertext),
-    )
+	message := make(
+		[]byte,
+		0,
+		len(prefix)+len(ciphertext),
+	)
 
-    message = append(message, prefix...)
-    message = append(message, ciphertext...)
+	message = append(message, prefix...)
+	message = append(message, ciphertext...)
 
-    return message
+	return message
 }
 
-//Generate the digital signature
+// Generate the digital signature
 func getInvitationSignatureMessage(
-    invitationUUID uuid.UUID,
-    fields InvitationSignedFields,
+	invitationUUID uuid.UUID,
+	fields InvitationSignedFields,
 ) ([]byte, error) {
-    fieldsBytes, err := json.Marshal(fields)
-    if err != nil {
-        return nil, err
-    }
+	fieldsBytes, err := json.Marshal(fields)
+	if err != nil {
+		return nil, err
+	}
 
-    prefix := []byte(
-        "invitation-signature:" +
-            invitationUUID.String() +
-            ":",
-    )
+	prefix := []byte(
+		"invitation-signature:" +
+			invitationUUID.String() +
+			":",
+	)
 
-    message := make(
-        []byte,
-        0,
-        len(prefix)+len(fieldsBytes),
-    )
+	message := make(
+		[]byte,
+		0,
+		len(prefix)+len(fieldsBytes),
+	)
 
-    message = append(message, prefix...)
-    message = append(message, fieldsBytes...)
+	message = append(message, prefix...)
+	message = append(message, fieldsBytes...)
 
-    return message, nil
+	return message, nil
 }
 
 func buildInvitation(
-    sender *User,
-    recipientPublicKey userlib.PKEEncKey,
-    invitationUUID uuid.UUID,
-    payload InvitationPayload,
+	sender *User,
+	recipientPublicKey userlib.PKEEncKey,
+	invitationUUID uuid.UUID,
+	payload InvitationPayload,
 ) ([]byte, error) {
-    if sender == nil {
-        return nil, errors.New("sender cannot be nil")
-    }
+	if sender == nil {
+		return nil, errors.New("sender cannot be nil")
+	}
 
-    if recipientPublicKey.KeyType != "PKE" {
-        return nil,
-            errors.New("invalid recipient PKE key")
-    }
+	if recipientPublicKey.KeyType != "PKE" {
+		return nil,
+			errors.New("invalid recipient PKE key")
+	}
 
-    inviteRoot := userlib.RandomBytes(
-        symmetricKeySize,
-    )
+	inviteRoot := userlib.RandomBytes(
+		symmetricKeySize,
+	)
 
-    invitationEncKey, invitationMACKey, err :=
-        deriveInvitationKeys(
-            inviteRoot,
-            invitationUUID,
-        )
-    if err != nil {
-        return nil, err
-    }
+	invitationEncKey, invitationMACKey, err :=
+		deriveInvitationKeys(
+			inviteRoot,
+			invitationUUID,
+		)
+	if err != nil {
+		return nil, err
+	}
 
-    payloadBytes, err := json.Marshal(payload)
-    if err != nil {
-        return nil, err
-    }
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
 
-    iv := userlib.RandomBytes(
-        userlib.AESBlockSizeBytes,
-    )
+	iv := userlib.RandomBytes(
+		userlib.AESBlockSizeBytes,
+	)
 
-    ciphertext := userlib.SymEnc(
-        invitationEncKey,
-        iv,
-        payloadBytes,
-    )
+	ciphertext := userlib.SymEnc(
+		invitationEncKey,
+		iv,
+		payloadBytes,
+	)
 
-    mac, err := userlib.HMACEval(
-        invitationMACKey,
-        getInvitationMACMessage(
-            invitationUUID,
-            ciphertext,
-        ),
-    )
-    if err != nil {
-        return nil, err
-    }
+	mac, err := userlib.HMACEval(
+		invitationMACKey,
+		getInvitationMACMessage(
+			invitationUUID,
+			ciphertext,
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
 
-    wrappedRoot, err := userlib.PKEEnc(
-        recipientPublicKey,
-        inviteRoot,
-    )
-    if err != nil {
-        return nil, err
-    }
+	wrappedRoot, err := userlib.PKEEnc(
+		recipientPublicKey,
+		inviteRoot,
+	)
+	if err != nil {
+		return nil, err
+	}
 
-    signedFields := InvitationSignedFields{
-        WrappedRoot: wrappedRoot,
-        Ciphertext:  ciphertext,
-        MAC:         mac,
-    }
+	signedFields := InvitationSignedFields{
+		WrappedRoot: wrappedRoot,
+		Ciphertext:  ciphertext,
+		MAC:         mac,
+	}
 
-    signatureMessage, err :=
-        getInvitationSignatureMessage(
-            invitationUUID,
-            signedFields,
-        )
-    if err != nil {
-        return nil, err
-    }
+	signatureMessage, err :=
+		getInvitationSignatureMessage(
+			invitationUUID,
+			signedFields,
+		)
+	if err != nil {
+		return nil, err
+	}
 
-    signature, err := userlib.DSSign(
-        sender.SignPrivate,
-        signatureMessage,
-    )
-    if err != nil {
-        return nil, err
-    }
+	signature, err := userlib.DSSign(
+		sender.SignPrivate,
+		signatureMessage,
+	)
+	if err != nil {
+		return nil, err
+	}
 
-    invitation := Invitation{
-        WrappedRoot: wrappedRoot,
-        Ciphertext:  ciphertext,
-        MAC:         mac,
-        Signature:   signature,
-    }
+	invitation := Invitation{
+		WrappedRoot: wrappedRoot,
+		Ciphertext:  ciphertext,
+		MAC:         mac,
+		Signature:   signature,
+	}
 
-    return json.Marshal(invitation)
+	return json.Marshal(invitation)
 }
 
 func loadOwnerAccessBoxStructure(
 	ctx context.Context,
-    namespaceEntry NamespaceEntry,
-    accessBox AccessBox,
+	namespaceEntry NamespaceEntry,
+	accessBox AccessBox,
 ) (AccessBoxStructure, error) {
-    var structure AccessBoxStructure
+	var structure AccessBoxStructure
 
-    if !namespaceEntry.IsOwner {
-        return structure,
-            errors.New("caller is not the owner")
-    }
+	if !namespaceEntry.IsOwner {
+		return structure,
+			errors.New("caller is not the owner")
+	}
 
-    if namespaceEntry.AccessBoxStructureUUID ==
-        uuid.Nil {
-        return structure,
-            errors.New("missing structure UUID")
-    }
+	if namespaceEntry.AccessBoxStructureUUID ==
+		uuid.Nil {
+		return structure,
+			errors.New("missing structure UUID")
+	}
 
-    if namespaceEntry.AccessBoxStructureUUID !=
-        accessBox.AccessBoxStructureUUID {
-        return structure,
-            errors.New("structure UUID mismatch")
-    }
+	if namespaceEntry.AccessBoxStructureUUID !=
+		accessBox.AccessBoxStructureUUID {
+		return structure,
+			errors.New("structure UUID mismatch")
+	}
 
-    if len(namespaceEntry.AccessBoxStructureEncKey) !=
-        symmetricKeySize ||
-        len(namespaceEntry.AccessBoxStructureMACKey) !=
-            symmetricKeySize {
-        return structure,
-            errors.New("invalid structure keys")
-    }
+	if len(namespaceEntry.AccessBoxStructureEncKey) !=
+		symmetricKeySize ||
+		len(namespaceEntry.AccessBoxStructureMACKey) !=
+			symmetricKeySize {
+		return structure,
+			errors.New("invalid structure keys")
+	}
 
-    err := loadDatastoreObject(ctx, 
-        accessBoxStructureObjectType,
-        namespaceEntry.AccessBoxStructureUUID,
-        namespaceEntry.AccessBoxStructureEncKey,
-        namespaceEntry.AccessBoxStructureMACKey,
-        &structure,
-    )
-    if err != nil {
-        return AccessBoxStructure{}, err
-    }
+	err := loadDatastoreObject(ctx,
+		accessBoxStructureObjectType,
+		namespaceEntry.AccessBoxStructureUUID,
+		namespaceEntry.AccessBoxStructureEncKey,
+		namespaceEntry.AccessBoxStructureMACKey,
+		&structure,
+	)
+	if err != nil {
+		return AccessBoxStructure{}, err
+	}
 
-    if structure.FileID != accessBox.FileID {
-        return AccessBoxStructure{},
-            errors.New("structure FileID mismatch")
-    }
+	if structure.FileID != accessBox.FileID {
+		return AccessBoxStructure{},
+			errors.New("structure FileID mismatch")
+	}
 
-    if structure.CurrentEpoch != accessBox.EpochID {
-        return AccessBoxStructure{},
-            errors.New("structure epoch mismatch")
-    }
+	if structure.CurrentEpoch != accessBox.EpochID {
+		return AccessBoxStructure{},
+			errors.New("structure epoch mismatch")
+	}
 
-    if structure.RecipientBoxes == nil {
-        return AccessBoxStructure{},
-            errors.New("invalid recipient map")
-    }
+	if structure.RecipientBoxes == nil {
+		return AccessBoxStructure{},
+			errors.New("invalid recipient map")
+	}
 
-    return structure, nil
+	return structure, nil
 }
 
 // CreateInvitation is the strict-2PL transaction boundary for sharing.
@@ -2911,6 +2932,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
 		return uuid.Nil, err
 	}
+	ctx = withFenceGrants(ctx, guard) // every lock is held; the commit must prove them
 
 	// Revalidated fresh, under File X -- never reuse AccessBox/FileStatus
 	// state read before this lock was granted.
@@ -2919,50 +2941,50 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 		return uuid.Nil, err
 	}
 
-	recipientPKEKey, exists, err := keystoreGet(ctx, 
-        getPKEKeyName(recipientUsername),
-    )
-    if err != nil {
-        return uuid.Nil, err
-    }
-    if !exists || recipientPKEKey.KeyType != "PKE" {
-        return uuid.Nil,
-            errors.New("recipient does not exist")
-    }
+	recipientPKEKey, exists, err := keystoreGet(ctx,
+		getPKEKeyName(recipientUsername),
+	)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if !exists || recipientPKEKey.KeyType != "PKE" {
+		return uuid.Nil,
+			errors.New("recipient does not exist")
+	}
 
-    recipientVerifyKey, exists, err :=
-        keystoreGet(ctx, 
-            getVerifyKeyName(recipientUsername),
-        )
-    if err != nil {
-        return uuid.Nil, err
-    }
-    if !exists ||
-        recipientVerifyKey.KeyType != "DS" {
-        return uuid.Nil,
-            errors.New("recipient does not exist")
-    }
+	recipientVerifyKey, exists, err :=
+		keystoreGet(ctx,
+			getVerifyKeyName(recipientUsername),
+		)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if !exists ||
+		recipientVerifyKey.KeyType != "DS" {
+		return uuid.Nil,
+			errors.New("recipient does not exist")
+	}
 
 	//target exsits, creat invitation
 	invitationUUID := uuid.New()
 
 	var grantedBoxUUID uuid.UUID
-    var grantedBoxEncKey []byte
-    var grantedBoxMACKey []byte
+	var grantedBoxEncKey []byte
+	var grantedBoxMACKey []byte
 
 	var protectedBranchBox []byte
-    var protectedUpdatedStructure []byte
+	var protectedUpdatedStructure []byte
 	var structureChanged bool
 
 	if namespaceEntry.IsOwner {
-        structure, err :=
-            loadOwnerAccessBoxStructure(ctx, 
-                namespaceEntry,
-                accessBox,
-            )
-        if err != nil {
-            return uuid.Nil, err
-        }
+		structure, err :=
+			loadOwnerAccessBoxStructure(ctx,
+				namespaceEntry,
+				accessBox,
+			)
+		if err != nil {
+			return uuid.Nil, err
+		}
 
 		fireConcurrencyTestHook("create-invitation:structure-loaded:" + accessBox.FileID.String())
 
@@ -3008,8 +3030,8 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 		)
 
 		if err != nil {
-            return uuid.Nil, err
-        }
+			return uuid.Nil, err
+		}
 
 		grantedBoxUUID = record.BoxUUID
 		grantedBoxEncKey = record.BoxEncKey
@@ -3017,29 +3039,29 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 	} else {
 		grantedBoxUUID = namespaceEntry.AccessBoxUUID
 		grantedBoxEncKey = namespaceEntry.AccessBoxEncKey
-        grantedBoxMACKey = namespaceEntry.AccessBoxMACKey
+		grantedBoxMACKey = namespaceEntry.AccessBoxMACKey
 	}
 
 	payload := InvitationPayload{
-		SenderIdentity: getInvitationIdentity(userdata.Username),
+		SenderIdentity:    getInvitationIdentity(userdata.Username),
 		RecipientIdentity: getInvitationIdentity(recipientUsername),
 
 		FileID: accessBox.FileID,
 
 		AccessBoxUUID:   grantedBoxUUID,
-        AccessBoxEncKey: grantedBoxEncKey,
-        AccessBoxMACKey: grantedBoxMACKey,
+		AccessBoxEncKey: grantedBoxEncKey,
+		AccessBoxMACKey: grantedBoxMACKey,
 	}
 
 	invitationBytes, err := buildInvitation(
-        userdata,
-        recipientPKEKey,
-        invitationUUID,
-        payload,
-    )
-    if err != nil {
-        return uuid.Nil, err
-    }
+		userdata,
+		recipientPKEKey,
+		invitationUUID,
+		payload,
+	)
+	if err != nil {
+		return uuid.Nil, err
+	}
 
 	// Commit point: an invitation is only usable if the access box it
 	// names exists and the owner's access-box structure records the new
@@ -3078,210 +3100,211 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 	return invitationUUID, nil
 }
 
-/**
+/*
+*
 Helper func for open invitation
-**/
+*
+*/
 func openInvitation(
 	ctx context.Context,
-    userdata *User,
-    senderUsername string,
-    invitationPtr uuid.UUID,
+	userdata *User,
+	senderUsername string,
+	invitationPtr uuid.UUID,
 ) (InvitationPayload, error) {
-    var emptyPayload InvitationPayload
+	var emptyPayload InvitationPayload
 
-    if userdata == nil {
-        return emptyPayload,
-            errors.New("recipient cannot be nil")
-    }
+	if userdata == nil {
+		return emptyPayload,
+			errors.New("recipient cannot be nil")
+	}
 
-    if invitationPtr == uuid.Nil {
-        return emptyPayload,
-            errors.New("invitation UUID cannot be nil")
-    }
+	if invitationPtr == uuid.Nil {
+		return emptyPayload,
+			errors.New("invitation UUID cannot be nil")
+	}
 
-    invitationBytes, exists, err :=
-        datastoreGet(ctx, invitationPtr)
+	invitationBytes, exists, err :=
+		datastoreGet(ctx, invitationPtr)
 
-    if err != nil {
-        return emptyPayload, err
-    }
+	if err != nil {
+		return emptyPayload, err
+	}
 
-    if !exists {
-        return emptyPayload,
-            errors.New("invitation is missing")
-    }
+	if !exists {
+		return emptyPayload,
+			errors.New("invitation is missing")
+	}
 
-    var invitation Invitation
+	var invitation Invitation
 
-    err = json.Unmarshal(
-        invitationBytes,
-        &invitation,
-    )
-    if err != nil {
-        return emptyPayload,
-            errors.New("invalid invitation")
-    }
+	err = json.Unmarshal(
+		invitationBytes,
+		&invitation,
+	)
+	if err != nil {
+		return emptyPayload,
+			errors.New("invalid invitation")
+	}
 
-    //Get the verification key
-    senderVerifyKey, exists, err :=
-        keystoreGet(ctx, 
-            getVerifyKeyName(senderUsername),
-        )
+	//Get the verification key
+	senderVerifyKey, exists, err :=
+		keystoreGet(ctx,
+			getVerifyKeyName(senderUsername),
+		)
 
-    if err != nil {
-        return emptyPayload, err
-    }
+	if err != nil {
+		return emptyPayload, err
+	}
 
-    if !exists ||
-        senderVerifyKey.KeyType != "DS" {
-        return emptyPayload,
-            errors.New("sender does not exist")
-    }
+	if !exists ||
+		senderVerifyKey.KeyType != "DS" {
+		return emptyPayload,
+			errors.New("sender does not exist")
+	}
 
-    signedFields := InvitationSignedFields{
-        WrappedRoot: invitation.WrappedRoot,
-        Ciphertext:  invitation.Ciphertext,
-        MAC:         invitation.MAC,
-    }
-
+	signedFields := InvitationSignedFields{
+		WrappedRoot: invitation.WrappedRoot,
+		Ciphertext:  invitation.Ciphertext,
+		MAC:         invitation.MAC,
+	}
 
 	//Get the message that to be verify
-    signatureMessage, err :=
-        getInvitationSignatureMessage(
-            invitationPtr,
-            signedFields,
-        )
-    if err != nil {
-        return emptyPayload, err
-    }
+	signatureMessage, err :=
+		getInvitationSignatureMessage(
+			invitationPtr,
+			signedFields,
+		)
+	if err != nil {
+		return emptyPayload, err
+	}
 
-    //Verify based on the signature, message, key
-    err = userlib.DSVerify(
-        senderVerifyKey,
-        signatureMessage,
-        invitation.Signature,
-    )
-    if err != nil {
-        return emptyPayload,
-            errors.New("invalid invitation signature")
-    }
+	//Verify based on the signature, message, key
+	err = userlib.DSVerify(
+		senderVerifyKey,
+		signatureMessage,
+		invitation.Signature,
+	)
+	if err != nil {
+		return emptyPayload,
+			errors.New("invalid invitation signature")
+	}
 
-    //Get the invite Root after verification
-    inviteRoot, err := userlib.PKEDec(
-        userdata.PKEPrivate,
-        invitation.WrappedRoot,
-    )
-    if err != nil {
-        return emptyPayload,
-            errors.New("cannot decrypt invitation root")
-    }
+	//Get the invite Root after verification
+	inviteRoot, err := userlib.PKEDec(
+		userdata.PKEPrivate,
+		invitation.WrappedRoot,
+	)
+	if err != nil {
+		return emptyPayload,
+			errors.New("cannot decrypt invitation root")
+	}
 
-    if len(inviteRoot) != symmetricKeySize {
-        return emptyPayload,
-            errors.New("invalid invitation root")
-    }
+	if len(inviteRoot) != symmetricKeySize {
+		return emptyPayload,
+			errors.New("invalid invitation root")
+	}
 
-    invitationEncKey, invitationMACKey, err :=
-        deriveInvitationKeys(
-            inviteRoot,
-            invitationPtr,
-        )
-    if err != nil {
-        return emptyPayload, err
-    }
+	invitationEncKey, invitationMACKey, err :=
+		deriveInvitationKeys(
+			inviteRoot,
+			invitationPtr,
+		)
+	if err != nil {
+		return emptyPayload, err
+	}
 
-    if len(invitation.MAC) !=
-        userlib.HashSizeBytes {
-        return emptyPayload,
-            errors.New("invalid invitation MAC length")
-    }
+	if len(invitation.MAC) !=
+		userlib.HashSizeBytes {
+		return emptyPayload,
+			errors.New("invalid invitation MAC length")
+	}
 
-    expectedMAC, err := userlib.HMACEval(
-        invitationMACKey,
-        getInvitationMACMessage(
-            invitationPtr,
-            invitation.Ciphertext,
-        ),
-    )
-    if err != nil {
-        return emptyPayload, err
-    }
+	expectedMAC, err := userlib.HMACEval(
+		invitationMACKey,
+		getInvitationMACMessage(
+			invitationPtr,
+			invitation.Ciphertext,
+		),
+	)
+	if err != nil {
+		return emptyPayload, err
+	}
 
-    if !userlib.HMACEqual(
-        expectedMAC,
-        invitation.MAC,
-    ) {
-        return emptyPayload,
-            errors.New("invitation authentication failed")
-    }
+	if !userlib.HMACEqual(
+		expectedMAC,
+		invitation.MAC,
+	) {
+		return emptyPayload,
+			errors.New("invitation authentication failed")
+	}
 
-    if len(invitation.Ciphertext) <
-        userlib.AESBlockSizeBytes {
-        return emptyPayload,
-            errors.New("invitation ciphertext is too short")
-    }
+	if len(invitation.Ciphertext) <
+		userlib.AESBlockSizeBytes {
+		return emptyPayload,
+			errors.New("invitation ciphertext is too short")
+	}
 
-    payloadBytes := userlib.SymDec(
-        invitationEncKey,
-        invitation.Ciphertext,
-    )
+	payloadBytes := userlib.SymDec(
+		invitationEncKey,
+		invitation.Ciphertext,
+	)
 
-    var payload InvitationPayload
+	var payload InvitationPayload
 
-    err = json.Unmarshal(
-        payloadBytes,
-        &payload,
-    )
-    if err != nil {
-        return emptyPayload,
-            errors.New("invalid invitation payload")
-    }
+	err = json.Unmarshal(
+		payloadBytes,
+		&payload,
+	)
+	if err != nil {
+		return emptyPayload,
+			errors.New("invalid invitation payload")
+	}
 
-    expectedSenderIdentity :=
-        getInvitationIdentity(senderUsername)
+	expectedSenderIdentity :=
+		getInvitationIdentity(senderUsername)
 
-    if len(payload.SenderIdentity) !=
-        userlib.HashSizeBytes ||
-        !userlib.HMACEqual(
-            payload.SenderIdentity,
-            expectedSenderIdentity,
-        ) {
-        return emptyPayload,
-            errors.New("invitation sender mismatch")
-    }
+	if len(payload.SenderIdentity) !=
+		userlib.HashSizeBytes ||
+		!userlib.HMACEqual(
+			payload.SenderIdentity,
+			expectedSenderIdentity,
+		) {
+		return emptyPayload,
+			errors.New("invitation sender mismatch")
+	}
 
-    expectedRecipientIdentity :=
-        getInvitationIdentity(userdata.Username)
+	expectedRecipientIdentity :=
+		getInvitationIdentity(userdata.Username)
 
-    if len(payload.RecipientIdentity) !=
-        userlib.HashSizeBytes ||
-        !userlib.HMACEqual(
-            payload.RecipientIdentity,
-            expectedRecipientIdentity,
-        ) {
-        return emptyPayload,
-            errors.New("invitation recipient mismatch")
-    }
+	if len(payload.RecipientIdentity) !=
+		userlib.HashSizeBytes ||
+		!userlib.HMACEqual(
+			payload.RecipientIdentity,
+			expectedRecipientIdentity,
+		) {
+		return emptyPayload,
+			errors.New("invitation recipient mismatch")
+	}
 
-    if payload.FileID == uuid.Nil {
-        return emptyPayload,
-            errors.New("invalid invitation FileID")
-    }
+	if payload.FileID == uuid.Nil {
+		return emptyPayload,
+			errors.New("invalid invitation FileID")
+	}
 
-    if payload.AccessBoxUUID == uuid.Nil {
-        return emptyPayload,
-            errors.New("invalid invitation AccessBox UUID")
-    }
+	if payload.AccessBoxUUID == uuid.Nil {
+		return emptyPayload,
+			errors.New("invalid invitation AccessBox UUID")
+	}
 
-    if len(payload.AccessBoxEncKey) !=
-        symmetricKeySize ||
-        len(payload.AccessBoxMACKey) !=
-            symmetricKeySize {
-        return emptyPayload,
-            errors.New("invalid invitation AccessBox keys")
-    }
+	if len(payload.AccessBoxEncKey) !=
+		symmetricKeySize ||
+		len(payload.AccessBoxMACKey) !=
+			symmetricKeySize {
+		return emptyPayload,
+			errors.New("invalid invitation AccessBox keys")
+	}
 
-    return payload, nil
+	return payload, nil
 }
 
 // AcceptInvitation is the strict-2PL transaction boundary for invitation
@@ -3309,8 +3332,8 @@ func openInvitation(
 func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid.UUID, filename string) error {
 	ctx := operationContext()
 	if userdata == nil {
-        return errors.New("recipient cannot be nil")
-    }
+		return errors.New("recipient cannot be nil")
+	}
 
 	txn, err := allocateTxnID()
 	if err != nil {
@@ -3331,14 +3354,15 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 	if err := guard.Acquire(nsResource, lockmanager.ExclusiveLock); err != nil {
 		return err
 	}
+	ctx = withFenceGrants(ctx, guard) // AcceptInvitation commits under namespace X alone
 
 	nameUUID, err := getNameSpaceEntryUUID(
-        userdata.Username,
-        filename,
-    )
-    if err != nil {
-        return err
-    }
+		userdata.Username,
+		filename,
+	)
+	if err != nil {
+		return err
+	}
 
 	// Occupancy check performed while Namespace X is held: no concurrent
 	// AcceptInvitation or StoreFile for this same (recipient, filename)
@@ -3346,31 +3370,31 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 	// check and this operation's own eventual install below.
 	_, occupied, err := datastoreGet(ctx, nameUUID)
 
-    if err != nil {
-        return err
-    }
+	if err != nil {
+		return err
+	}
 
-    if occupied {
-        return errors.New("filename is already in use")
-    }
+	if occupied {
+		return errors.New("filename is already in use")
+	}
 
 	namespaceEncKey, namespaceMACKey, err :=
-        deriveNamespaceEntryKeys(
-            userdata.NamespaceRoot,
-            filename,
-        )
-    if err != nil {
-        return err
-    }
+		deriveNamespaceEntryKeys(
+			userdata.NamespaceRoot,
+			filename,
+		)
+	if err != nil {
+		return err
+	}
 
-	payload, err := openInvitation(ctx, 
-        userdata,
-        senderUsername,
-        invitationPtr,
-    )
-    if err != nil {
-        return err
-    }
+	payload, err := openInvitation(ctx,
+		userdata,
+		senderUsername,
+		invitationPtr,
+	)
+	if err != nil {
+		return err
+	}
 
 	fileResource := fileResourceID(payload.FileID)
 	if err := guard.Acquire(fileResource, lockmanager.SharedLock); err != nil {
@@ -3388,30 +3412,30 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 	fireConcurrencyTestHook("accept:validated:" + payload.FileID.String())
 
 	sharedEntry := NamespaceEntry{
-        IsOwner: false,
-        FileID:  payload.FileID,
+		IsOwner: false,
+		FileID:  payload.FileID,
 
-        AccessBoxUUID:   payload.AccessBoxUUID,
-        AccessBoxEncKey: payload.AccessBoxEncKey,
-        AccessBoxMACKey: payload.AccessBoxMACKey,
+		AccessBoxUUID:   payload.AccessBoxUUID,
+		AccessBoxEncKey: payload.AccessBoxEncKey,
+		AccessBoxMACKey: payload.AccessBoxMACKey,
 
-        // Shared user doesnt have owner-only structure credentials
-        AccessBoxStructureUUID:   uuid.Nil,
-        AccessBoxStructureEncKey: nil,
-        AccessBoxStructureMACKey: nil,
-    }
+		// Shared user doesnt have owner-only structure credentials
+		AccessBoxStructureUUID:   uuid.Nil,
+		AccessBoxStructureEncKey: nil,
+		AccessBoxStructureMACKey: nil,
+	}
 
 	protectedNamespaceEntry, err :=
-        protectDatastoreObject(
-            namespaceEntryObjectType,
-            nameUUID,
-            sharedEntry,
-            namespaceEncKey,
-            namespaceMACKey,
-        )
-    if err != nil {
-        return err
-    }
+		protectDatastoreObject(
+			namespaceEntryObjectType,
+			nameUUID,
+			sharedEntry,
+			namespaceEncKey,
+			namespaceMACKey,
+		)
+	if err != nil {
+		return err
+	}
 
 	// Commit point: accepting an invitation installs the recipient's
 	// namespace entry and consumes the invitation. Installing the entry
@@ -3471,15 +3495,16 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
 	}
 
 	if !namespaceEntry.IsOwner {
-        return errors.New(
-            "only the file owner can revoke access",
-        )
-    }
+		return errors.New(
+			"only the file owner can revoke access",
+		)
+	}
 
 	fileResource := fileResourceID(namespaceEntry.FileID)
 	if err := guard.Acquire(fileResource, lockmanager.ExclusiveLock); err != nil {
 		return err
 	}
+	ctx = withFenceGrants(ctx, guard) // every lock is held; the commit must prove them
 
 	// Revalidated fresh, under File X -- never reuse AccessBox/FileStatus
 	// state read before this lock was granted.
@@ -3490,209 +3515,209 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
 
 	//load the structure
 	structure, err :=
-        loadOwnerAccessBoxStructure(ctx, 
-            namespaceEntry,
-            currentAccessBox,
-        )
-    if err != nil {
-        return err
-    }
+		loadOwnerAccessBoxStructure(ctx,
+			namespaceEntry,
+			currentAccessBox,
+		)
+	if err != nil {
+		return err
+	}
 
 	revokedRecord, exists :=
-        structure.RecipientBoxes[recipientUsername]
+		structure.RecipientBoxes[recipientUsername]
 
-    if !exists {
-        return errors.New(
-            "recipient is not a direct share",
-        )
-    }
+	if !exists {
+		return errors.New(
+			"recipient is not a direct share",
+		)
+	}
 
 	//load the metadata
 	metadata, err := loadMetadata(ctx, currentAccessBox)
-    if err != nil {
-        return err
-    }
+	if err != nil {
+		return err
+	}
 
 	fileContent, oldChunkUUIDs, err :=
-        loadFileContentAndChunkUUIDs(ctx, 
-            currentAccessBox,
-            metadata,
-        )
-    if err != nil {
-        return err
-    }
+		loadFileContentAndChunkUUIDs(ctx,
+			currentAccessBox,
+			metadata,
+		)
+	if err != nil {
+		return err
+	}
 
 	fireConcurrencyTestHook("revoke:content-loaded:" + currentAccessBox.FileID.String())
 
 	//All clear, time to update the new access box for users
 	newEpochID := uuid.New()
-    newFileRoot := userlib.RandomBytes(
-        symmetricKeySize,
-    )
+	newFileRoot := userlib.RandomBytes(
+		symmetricKeySize,
+	)
 
 	newMetadataUUID := uuid.New()
-    newMetadataEncKey := userlib.RandomBytes(
-        symmetricKeySize,
-    )
-    newMetadataMACKey := userlib.RandomBytes(
-        symmetricKeySize,
-    )
+	newMetadataEncKey := userlib.RandomBytes(
+		symmetricKeySize,
+	)
+	newMetadataMACKey := userlib.RandomBytes(
+		symmetricKeySize,
+	)
 
 	newBaseChunkUUID := uuid.New()
 
-    newChunk := Chunk{
-        FileID:   currentAccessBox.FileID,
-        EpochID:  newEpochID,
-        Index:    0,
-        PrevUUID: uuid.Nil,
-        Content:  fileContent,
-    }
+	newChunk := Chunk{
+		FileID:   currentAccessBox.FileID,
+		EpochID:  newEpochID,
+		Index:    0,
+		PrevUUID: uuid.Nil,
+		Content:  fileContent,
+	}
 
 	newChunkEncKey, newChunkMACKey, err :=
-        deriveChunkKeys(
-            newFileRoot,
-            newBaseChunkUUID,
-        )
-    if err != nil {
-        return err
-    }
+		deriveChunkKeys(
+			newFileRoot,
+			newBaseChunkUUID,
+		)
+	if err != nil {
+		return err
+	}
 
 	protectedNewChunk, err :=
-        protectDatastoreObject(
-            chunkObjectType,
-            newBaseChunkUUID,
-            newChunk,
-            newChunkEncKey,
-            newChunkMACKey,
-        )
-    if err != nil {
-        return err
-    }
+		protectDatastoreObject(
+			chunkObjectType,
+			newBaseChunkUUID,
+			newChunk,
+			newChunkEncKey,
+			newChunkMACKey,
+		)
+	if err != nil {
+		return err
+	}
 
 	// Epoch rotation re-encrypts the same logical content under a new
 	// epoch/FileRoot/keys -- it is a physical migration of authorization
 	// state, not a logical content mutation, so Version is carried over
 	// unchanged rather than advanced (only EpochID changes).
 	newMetadata := Metadata{
-        FileID:     currentAccessBox.FileID,
-        EpochID:    newEpochID,
-        Version:    metadata.Version,
-        TailUUID:   newBaseChunkUUID,
-        ChunkCount: 1,
-    }
+		FileID:     currentAccessBox.FileID,
+		EpochID:    newEpochID,
+		Version:    metadata.Version,
+		TailUUID:   newBaseChunkUUID,
+		ChunkCount: 1,
+	}
 
 	protectedNewMetadata, err :=
-        protectDatastoreObject(
-            metadataObjectType,
-            newMetadataUUID,
-            newMetadata,
-            newMetadataEncKey,
-            newMetadataMACKey,
-        )
-    if err != nil {
-        return err
-    }
+		protectDatastoreObject(
+			metadataObjectType,
+			newMetadataUUID,
+			newMetadata,
+			newMetadataEncKey,
+			newMetadataMACKey,
+		)
+	if err != nil {
+		return err
+	}
 
 	newAccessBox := AccessBox{
-        FileID:  currentAccessBox.FileID,
-        EpochID: newEpochID,
+		FileID:  currentAccessBox.FileID,
+		EpochID: newEpochID,
 
-        MetadataUUID:   newMetadataUUID,
-        MetadataEncKey: newMetadataEncKey,
-        MetadataMACKey: newMetadataMACKey,
+		MetadataUUID:   newMetadataUUID,
+		MetadataEncKey: newMetadataEncKey,
+		MetadataMACKey: newMetadataMACKey,
 
-        FileRoot: newFileRoot,
+		FileRoot: newFileRoot,
 
-        //These remain stable
-        AccessBoxStructureUUID: currentAccessBox.AccessBoxStructureUUID,
-        StatusUUID: currentAccessBox.StatusUUID,
-		OwnerVerifyKeyName: currentAccessBox.OwnerVerifyKeyName,
-    }
+		//These remain stable
+		AccessBoxStructureUUID: currentAccessBox.AccessBoxStructureUUID,
+		StatusUUID:             currentAccessBox.StatusUUID,
+		OwnerVerifyKeyName:     currentAccessBox.OwnerVerifyKeyName,
+	}
 
 	protectedOwnerAccessBox, err :=
-        protectDatastoreObject(
-            accessBoxObjectType,
-            namespaceEntry.AccessBoxUUID,
-            newAccessBox,
-            namespaceEntry.AccessBoxEncKey,
-            namespaceEntry.AccessBoxMACKey,
-        )
-    if err != nil {
-        return err
-    }
+		protectDatastoreObject(
+			accessBoxObjectType,
+			namespaceEntry.AccessBoxUUID,
+			newAccessBox,
+			namespaceEntry.AccessBoxEncKey,
+			namespaceEntry.AccessBoxMACKey,
+		)
+	if err != nil {
+		return err
+	}
 
 	type preparedBoxWrite struct {
-        BoxUUID uuid.UUID
-        Data    []byte
-    }
+		BoxUUID uuid.UUID
+		Data    []byte
+	}
 
 	survivingWrites := make(
-        []preparedBoxWrite,
-        0,
-    )
+		[]preparedBoxWrite,
+		0,
+	)
 
 	for directRecipient, record := range structure.RecipientBoxes {
 		if directRecipient == recipientUsername {
-            // Do not give the revoked branch the new capability.
-            continue
-        }
+			// Do not give the revoked branch the new capability.
+			continue
+		}
 
 		protectedBranchBox, err :=
-            protectDatastoreObject(
-                accessBoxObjectType,
-                record.BoxUUID,
-                newAccessBox,
-                record.BoxEncKey,
-                record.BoxMACKey,
-            )
-		
+			protectDatastoreObject(
+				accessBoxObjectType,
+				record.BoxUUID,
+				newAccessBox,
+				record.BoxEncKey,
+				record.BoxMACKey,
+			)
+
 		if err != nil {
-            return err
-        }
-		
+			return err
+		}
+
 		survivingWrites = append(
-            survivingWrites,
-            preparedBoxWrite{
-                BoxUUID: record.BoxUUID,
-                Data:    protectedBranchBox,
-            },
-        )
+			survivingWrites,
+			preparedBoxWrite{
+				BoxUUID: record.BoxUUID,
+				Data:    protectedBranchBox,
+			},
+		)
 	}
 
 	delete(
-        structure.RecipientBoxes,
-        recipientUsername,
-    )
+		structure.RecipientBoxes,
+		recipientUsername,
+	)
 
 	structure.CurrentEpoch = newEpochID
 
 	protectedUpdatedStructure, err :=
-        protectDatastoreObject(
-            accessBoxStructureObjectType,
-            namespaceEntry.AccessBoxStructureUUID,
-            structure,
-            namespaceEntry.AccessBoxStructureEncKey,
-            namespaceEntry.AccessBoxStructureMACKey,
-        )
-    if err != nil {
-        return err
-    }
+		protectDatastoreObject(
+			accessBoxStructureObjectType,
+			namespaceEntry.AccessBoxStructureUUID,
+			structure,
+			namespaceEntry.AccessBoxStructureEncKey,
+			namespaceEntry.AccessBoxStructureMACKey,
+		)
+	if err != nil {
+		return err
+	}
 
 	newFileStatus, err := createFileStatus(
-        userdata,
-        currentAccessBox.StatusUUID,
-        newAccessBox,
-    )
-    if err != nil {
-        return err
-    }
+		userdata,
+		currentAccessBox.StatusUUID,
+		newAccessBox,
+	)
+	if err != nil {
+		return err
+	}
 
 	//Marshal it
 	newFileStatusBytes, err :=
-        json.Marshal(newFileStatus)
-    if err != nil {
-        return err
-    }
+		json.Marshal(newFileStatus)
+	if err != nil {
+		return err
+	}
 
 	// Commit point: revocation is an epoch rotation, and it is the
 	// largest and most dangerous multi-object mutation SAFER performs. It
