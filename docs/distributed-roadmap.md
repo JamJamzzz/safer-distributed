@@ -804,15 +804,37 @@ Every gRPC boundary in the system carries trace context automatically via
 `otelgrpc.NewServerHandler()`/`NewClientHandler()` (the modern `stats.Handler` API):
 worker server, coordinator server, worker-to-coordinator client
 (`client/coordination/grpccoord`), and loadgen-to-worker client (`cmd/loadgen/dial.go`).
-This is what makes a trace follow `loadgen -> worker RPC -> SAFER operation ->
-coordinator Acquire -> MongoDB transaction` as one connected trace rather than four
-disconnected ones. On top of that, manual spans cover the parts automatic RPC tracing
-does not see inside each hop:
+This is what makes a trace follow one connected shape rather than several disconnected
+ones. For `StoreFile`/`AppendToFile`/`LoadFile`, that shape is (indentation = child of
+the line above; siblings share a parent and do not nest under each other):
+
+```
+loadgen client RPC
+  -> worker server RPC
+       -> worker.authenticate
+       -> safer.<Operation>
+            -> worker -> coordinator gRPC
+                 -> coordinator server Acquire
+                      -> coordinator.lock_wait
+            -> mongostore.run_atomic
+```
+
+`worker.authenticate` and `safer.<Operation>` are **siblings** under the worker RPC
+span, not nested inside each other -- authentication (`cmd/worker/service.go`'s
+`authenticate` helper) runs to completion, ending its own span, before
+`safer.<Operation>` starts its own from the same parent. `InitUser` is the one
+exception: `cmd/worker/authlimit.go`'s admission limiter still gates it (the same
+`authLimiter.acquire`/`release` pair), but `InitUser`'s handler calls that directly
+rather than through the `authenticate` helper, so it does **not** currently produce a
+`worker.authenticate` span -- only its own `safer.InitUser` span. `mongostore.run_atomic`
+and the worker-to-coordinator `Acquire` call are both reached from inside
+`safer.<Operation>`, not from `worker.authenticate`, and are siblings of each other, not
+nested inside one another.
 
 - Worker (`cmd/worker/service.go`, `cmd/worker/authlimit.go`): `worker.authenticate`
-  wraps the auth-admission wait plus `GetUserContext`/`InitUserContext`; a
-  `safer.<Operation>` span (`safer.InitUser`, `safer.StoreFile`, `safer.AppendToFile`,
-  `safer.LoadFile`) wraps each handler's actual SAFER call.
+  wraps the auth-admission wait plus `GetUserContext` (StoreFile/AppendToFile/LoadFile
+  only -- see above); a `safer.<Operation>` span (`safer.InitUser`, `safer.StoreFile`,
+  `safer.AppendToFile`, `safer.LoadFile`) wraps each handler's actual SAFER call.
 - Coordinator (`client/coordination/grpccoord/server.go`): `coordinator.lock_wait` wraps
   the real `AcquireContext` wait (not the idempotent-retry fast path) with `lock.mode`/
   `resource.type` attributes; `coordinator.teardown` wraps lease/lock release with a
@@ -847,11 +869,22 @@ string or identifier.
 
 ### Logging
 
-No custom logging framework was added; the existing `log.Printf`-based output from
-each binary is left as-is and picked up by the Datadog Agent's standard container log
-collection. Trace/span-ID log correlation was **not** implemented -- doing it properly
-means routing every log line through a context-aware logger, which none of the three
-binaries have today, and retrofitting one was judged out of this phase's narrow scope.
+No custom logging framework was added; each binary's existing `log.Printf`-based
+output is left exactly as it was before Phase 5, going to the container's ordinary
+stdout/stderr where `kubectl logs` already reads it. This section originally claimed
+that output was "picked up by the Datadog Agent's standard container log collection";
+that was wrong and has been corrected here. The DatadogAgent CR this deployment
+actually uses does **not** enable `spec.features.logCollection` -- only infrastructure
+telemetry and (as of this phase) OTLP trace/metric ingestion are on. Enabling
+cluster-wide log collection is a real scope expansion of what the Agent does (a new
+`features` toggle on a CR this repository does not own the lifecycle of, plus whatever
+volume/cost implications follow for every pod in the cluster, not just SAFER's three),
+and Phase 5 was never asked to make that change, so it was not made. Datadog log
+ingestion for this repository's binaries was **not** enabled and **not** verified in
+this phase; trace/span-ID log correlation was, separately, also **not** implemented --
+doing that properly means routing every log line through a context-aware logger, which
+none of the three binaries have today, and retrofitting one was judged out of this
+phase's narrow scope regardless of where the logs end up.
 
 ### Datadog Agent: inspected, not reinstalled
 
@@ -895,14 +928,16 @@ restarted:
   minute)" stats-payload counters were non-zero immediately after a run. This is local,
   Agent-side evidence that OTLP-derived trace data tagged with this repository's exact
   service names is reaching and being processed by the Agent. It is not the same as
-  visually confirming traces, metrics, and logs in the Datadog UI -- that verification
-  is manual and belongs to whoever has access to it, not something this repository can
+  visually confirming traces and metrics in the Datadog UI -- that verification is
+  manual and belongs to whoever has access to it, not something this repository can
   fabricate. See the corresponding session handoff for the exact service names, span
-  names, metric names, and log filters to check.
+  names, and metric names to check. Datadog log ingestion was not enabled in this
+  phase (see "Logging" above), so there is nothing to check there yet.
 
 ### What Phase 5 does not attempt
 
-No log/trace correlation (noted above). No answer yet to the "same-file-writes latency
+Datadog log ingestion was not enabled or verified (see "Logging" above); no log/trace
+correlation, for the same reason. No answer yet to the "same-file-writes latency
 breakdown" question Phase 5 set out to use telemetry for: the actual observed
 `safer.coordinator.lock.wait.duration`, `safer.worker.auth_admission.wait.duration`,
 and `safer.storage.transaction.duration` values only exist in Datadog once ingested,
