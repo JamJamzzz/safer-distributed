@@ -149,67 +149,33 @@ var activeStorage = storage.NewUserlibStorage()
 // promises.
 func storageContext() context.Context { return context.Background() }
 
-// noteStorageFailure records a backend failure.
+// The wrappers below return backend errors to their callers.
 //
-// The userlib backend never fails, so V1's wrapper signatures return no
-// error and the ~40 existing call sites are unchanged by Phase 1.
-// A durable backend can fail, and swallowing that silently would be
-// wrong. Until error returns are plumbed through the wrappers and their
-// call sites -- the first task of Phase 2, done against a backend that can
-// actually produce errors -- failures are surfaced here rather than
-// discarded, and are observable via lastStorageFailure for tests.
-func noteStorageFailure(op string, err error) {
-	if err == nil {
-		return
-	}
-	userlib.DebugMsg("storage backend failure in %s: %v", op, err)
-	lastStorageFailureMu.Lock()
-	defer lastStorageFailureMu.Unlock()
-	lastStorageFailureErr = fmt.Errorf("%s: %w", op, err)
+// The userlib backend cannot fail, so in V1 these returned only a value
+// and a found flag. A durable backend can fail, and SAFER must be able to
+// tell "this object does not exist" -- a meaningful, expected answer that
+// drives real control flow -- apart from "the backend did not answer".
+// Collapsing the two would let an outage read as a missing file, and would
+// let a failed write report success and silently lose data.
+//
+// The context is context.Background() for now: V1's public API takes no
+// context, so there is nothing to propagate yet. Threading per-operation
+// deadlines through the public SAFER API would change that API and is not
+// part of this change.
+func datastoreGet(id uuid.UUID) ([]byte, bool, error) {
+	return activeStorage.Objects.Get(storageContext(), id)
 }
 
-var (
-	lastStorageFailureMu  sync.Mutex
-	lastStorageFailureErr error
-)
-
-// lastStorageFailure returns the most recent backend failure recorded by
-// noteStorageFailure, or nil. It exists so tests can assert that failures
-// are not silently dropped.
-func lastStorageFailure() error {
-	lastStorageFailureMu.Lock()
-	defer lastStorageFailureMu.Unlock()
-	return lastStorageFailureErr
+func datastoreSet(id uuid.UUID, value []byte) error {
+	return activeStorage.Objects.Put(storageContext(), id, value)
 }
 
-func datastoreGet(id uuid.UUID) ([]byte, bool) {
-	value, found, err := activeStorage.Objects.Get(storageContext(), id)
-	if err != nil {
-		noteStorageFailure("datastoreGet", err)
-		return nil, false
-	}
-	return value, found
+func datastoreDelete(id uuid.UUID) error {
+	return activeStorage.Objects.Delete(storageContext(), id)
 }
 
-func datastoreSet(id uuid.UUID, value []byte) {
-	if err := activeStorage.Objects.Put(storageContext(), id, value); err != nil {
-		noteStorageFailure("datastoreSet", err)
-	}
-}
-
-func datastoreDelete(id uuid.UUID) {
-	if err := activeStorage.Objects.Delete(storageContext(), id); err != nil {
-		noteStorageFailure("datastoreDelete", err)
-	}
-}
-
-func keystoreGet(name string) (userlib.PublicKeyType, bool) {
-	key, found, err := activeStorage.Keys.Get(storageContext(), name)
-	if err != nil {
-		noteStorageFailure("keystoreGet", err)
-		return userlib.PublicKeyType{}, false
-	}
-	return key, found
+func keystoreGet(name string) (userlib.PublicKeyType, bool, error) {
+	return activeStorage.Keys.Get(storageContext(), name)
 }
 
 func keystoreSet(name string, key userlib.PublicKeyType) error {
@@ -278,13 +244,25 @@ func getVerifyKeyName(username string) string {
 	return publicKeyName("signature-verify-key", username)
 }
 
-//To check whether this account is taken or not
-func isUsernameTaken(username string, accountUUID uuid.UUID) bool {
-	_, accountExists := datastoreGet(accountUUID)
-	_, pkeExists := keystoreGet(getPKEKeyName(username))
-	_, verifyExists := keystoreGet(getVerifyKeyName(username))
+//To check whether this account is taken or not.
+//A storage failure is reported as an error rather than as "not taken":
+//treating an unreachable backend as a free username would let a second
+//account overwrite an existing one.
+func isUsernameTaken(username string, accountUUID uuid.UUID) (bool, error) {
+	_, accountExists, err := datastoreGet(accountUUID)
+	if err != nil {
+		return false, err
+	}
+	_, pkeExists, err := keystoreGet(getPKEKeyName(username))
+	if err != nil {
+		return false, err
+	}
+	_, verifyExists, err := keystoreGet(getVerifyKeyName(username))
+	if err != nil {
+		return false, err
+	}
 
-	return accountExists || pkeExists || verifyExists
+	return accountExists || pkeExists || verifyExists, nil
 }
 
 //derive the secret keys for enc and mac
@@ -376,7 +354,11 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 		return nil, err
 	}
 
-	if isUsernameTaken(username, accountUUID) {
+	taken, err := isUsernameTaken(username, accountUUID)
+	if err != nil {
+		return nil, err
+	}
+	if taken {
 		return nil, errors.New("username already exits")
 	}
 
@@ -445,7 +427,9 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	//Store the emac account to datastore
-	datastoreSet(accountUUID, encAccount)
+	if err := datastoreSet(accountUUID, encAccount); err != nil {
+		return nil, err
+	}
 
 	userdata := User{
 		Username:      username,
@@ -531,7 +515,11 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
     }
 
 	//Get the envelope
-	envelopeBytes, exists := datastoreGet(accountUUID)
+	envelopeBytes, exists, err := datastoreGet(accountUUID)
+
+	if err != nil {
+		return nil, err
+	}
 
 	if !exists {
 		return nil, errors.New("user account does not exits")
@@ -1366,35 +1354,47 @@ func (userdata *User) storeNewFileLocked(
     	return err
 	}
 
-	datastoreSet(
+	if err := datastoreSet(
 		baseChunkUUID,
 		protectedChunk,
-	)
+	); err != nil {
+		return err
+	}
 
-	datastoreSet(
+	if err := datastoreSet(
 		metadataUUID,
 		protectedMetadata,
-	)
+	); err != nil {
+		return err
+	}
 
-	datastoreSet(
+	if err := datastoreSet(
 		ownerAccessBoxUUID,
 		protectedAccessBox,
-	)
+	); err != nil {
+		return err
+	}
 
-	datastoreSet(
+	if err := datastoreSet(
 		statusUUID,
 		fileStatusBytes,
-	)
+	); err != nil {
+		return err
+	}
 
-	datastoreSet(
+	if err := datastoreSet(
 		structureUUID,
 		protectedAccessBoxStructure,
-	)
+	); err != nil {
+		return err
+	}
 
-	datastoreSet(
+	if err := datastoreSet(
 		nameUUID,
 		protectedNamespaceEntry,
-	)
+	); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -1499,17 +1499,23 @@ func overwriteExistingFileLocked(
     }
 
 	//Set the new chunk and new metadata
-	datastoreSet(
+	if err := datastoreSet(
         newBaseChunkUUID,
         protectedNewChunk,
-    )
+    ); err != nil {
+		return err
+	}
 
-    datastoreSet(
+    if err := datastoreSet(
         accessBox.MetadataUUID,
         protectedNewMetadata,
-    )
+    ); err != nil {
+    	return err
+    }
 	for _, oldChunkUUID := range oldChunkUUIDs {
-        datastoreDelete(oldChunkUUID)
+        if err := datastoreDelete(oldChunkUUID); err != nil {
+        	return err
+        }
     }
 
     return nil
@@ -1556,7 +1562,11 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
         return err
     }
 
-	_, exists := datastoreGet(nameUUID)
+	_, exists, err := datastoreGet(nameUUID)
+
+	if err != nil {
+		return err
+	}
 
 	if exists {
 		namespaceEntry, err := loadNamespaceEntry(userdata, filename)
@@ -1709,15 +1719,19 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
         return err
     }
 
-	datastoreSet(
+	if err := datastoreSet(
         newChunkUUID,
         protectedNewChunk,
-    )
+    ); err != nil {
+		return err
+	}
 
-    datastoreSet(
+    if err := datastoreSet(
         accessBox.MetadataUUID,
         protectedUpdatedMetadata,
-    )
+    ); err != nil {
+    	return err
+    }
 
     return nil
 }
@@ -1745,13 +1759,16 @@ func loadDatastoreObject(
         return errors.New("invalid object keys")
     }
 
-    envelopeBytes, exists := datastoreGet(objectUUID)
+    envelopeBytes, exists, err := datastoreGet(objectUUID)
+    if err != nil {
+        return err
+    }
     if !exists {
         return errors.New("required datastore object is missing")
     }
 
     var envelope AuthenticatedEnvelope
-    err := json.Unmarshal(envelopeBytes, &envelope)
+    err = json.Unmarshal(envelopeBytes, &envelope)
     if err != nil {
         return errors.New("invalid datastore envelope")
     }
@@ -1800,9 +1817,13 @@ func verifyFileStatus(
 		return errors.New("invalid status uuid")
 	}
 
-	statusBytes, exists := datastoreGet(
+	statusBytes, exists, err := datastoreGet(
 		accessBox.StatusUUID,
 	)
+
+	if err != nil {
+		return err
+	}
 
 	if !exists {
         return errors.New("file status is missing")
@@ -1810,14 +1831,18 @@ func verifyFileStatus(
 
 	//Unmarshal the statusBytes
 	var status FileStatus
-    err := json.Unmarshal(statusBytes, &status)
+    err = json.Unmarshal(statusBytes, &status)
     if err != nil {
         return errors.New("invalid file status")
     }
 
-	verifyKey, exists := keystoreGet(
+	verifyKey, exists, err := keystoreGet(
 		accessBox.OwnerVerifyKeyName,
 	)
+
+	if err != nil {
+		return err
+	}
 
 	if !exists {
         return errors.New("owner verification key is missing")
@@ -2729,18 +2754,24 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 		return uuid.Nil, err
 	}
 
-	recipientPKEKey, exists := keystoreGet(
+	recipientPKEKey, exists, err := keystoreGet(
         getPKEKeyName(recipientUsername),
     )
+    if err != nil {
+        return uuid.Nil, err
+    }
     if !exists || recipientPKEKey.KeyType != "PKE" {
         return uuid.Nil,
             errors.New("recipient does not exist")
     }
 
-    recipientVerifyKey, exists :=
+    recipientVerifyKey, exists, err :=
         keystoreGet(
             getVerifyKeyName(recipientUsername),
         )
+    if err != nil {
+        return uuid.Nil, err
+    }
     if !exists ||
         recipientVerifyKey.KeyType != "DS" {
         return uuid.Nil,
@@ -2846,23 +2877,29 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
     }
 
 	if namespaceEntry.IsOwner {
-        datastoreSet(
+        if err := datastoreSet(
 			grantedBoxUUID,
 			protectedBranchBox,
-		)
+		); err != nil {
+        	return uuid.Nil, err
+        }
 
 		if structureChanged {
-			datastoreSet(
+			if err := datastoreSet(
 				namespaceEntry.AccessBoxStructureUUID,
 				protectedUpdatedStructure,
-			)
+			); err != nil {
+				return uuid.Nil, err
+			}
 		}
 	}
 
-	datastoreSet(
+	if err := datastoreSet(
         invitationUUID,
         invitationBytes,
-    )
+    ); err != nil {
+		return uuid.Nil, err
+	}
 
 	return invitationUUID, nil
 }
@@ -2887,8 +2924,12 @@ func openInvitation(
             errors.New("invitation UUID cannot be nil")
     }
 
-    invitationBytes, exists :=
+    invitationBytes, exists, err :=
         datastoreGet(invitationPtr)
+
+    if err != nil {
+        return emptyPayload, err
+    }
 
     if !exists {
         return emptyPayload,
@@ -2897,7 +2938,7 @@ func openInvitation(
 
     var invitation Invitation
 
-    err := json.Unmarshal(
+    err = json.Unmarshal(
         invitationBytes,
         &invitation,
     )
@@ -2907,10 +2948,14 @@ func openInvitation(
     }
 
     //Get the verification key
-    senderVerifyKey, exists :=
+    senderVerifyKey, exists, err :=
         keystoreGet(
             getVerifyKeyName(senderUsername),
         )
+
+    if err != nil {
+        return emptyPayload, err
+    }
 
     if !exists ||
         senderVerifyKey.KeyType != "DS" {
@@ -3120,7 +3165,11 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 	// AcceptInvitation or StoreFile for this same (recipient, filename)
 	// can install/observe a different namespace state in between this
 	// check and this operation's own eventual install below.
-	_, occupied := datastoreGet(nameUUID)
+	_, occupied, err := datastoreGet(nameUUID)
+
+    if err != nil {
+        return err
+    }
 
     if occupied {
         return errors.New("filename is already in use")
@@ -3185,12 +3234,16 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
         return err
     }
 
-	datastoreSet(
+	if err := datastoreSet(
         nameUUID,
         protectedNamespaceEntry,
-    )
+    ); err != nil {
+		return err
+	}
 
-    datastoreDelete(invitationPtr)
+    if err := datastoreDelete(invitationPtr); err != nil {
+    	return err
+    }
 
     return nil
 }
@@ -3455,48 +3508,66 @@ func (userdata *User) RevokeAccess(filename string, recipientUsername string) er
         return err
     }
 
-	datastoreSet(
+	if err := datastoreSet(
         newBaseChunkUUID,
         protectedNewChunk,
-    )
+    ); err != nil {
+		return err
+	}
 
-    datastoreSet(
+    if err := datastoreSet(
         newMetadataUUID,
         protectedNewMetadata,
-    )
-
-	datastoreSet(
-        namespaceEntry.AccessBoxUUID,
-        protectedOwnerAccessBox,
-    )
-
-	for _, write := range survivingWrites {
-        datastoreSet(
-            write.BoxUUID,
-            write.Data,
-        )
+    ); err != nil {
+    	return err
     }
 
-	datastoreSet(
+	if err := datastoreSet(
+        namespaceEntry.AccessBoxUUID,
+        protectedOwnerAccessBox,
+    ); err != nil {
+		return err
+	}
+
+	for _, write := range survivingWrites {
+        if err := datastoreSet(
+            write.BoxUUID,
+            write.Data,
+        ); err != nil {
+        	return err
+        }
+    }
+
+	if err := datastoreSet(
         namespaceEntry.AccessBoxStructureUUID,
         protectedUpdatedStructure,
-    )
+    ); err != nil {
+		return err
+	}
 
-    datastoreSet(
+    if err := datastoreSet(
         currentAccessBox.StatusUUID,
         newFileStatusBytes,
-    )
+    ); err != nil {
+    	return err
+    }
 
-	datastoreDelete(
+	if err := datastoreDelete(
         revokedRecord.BoxUUID,
-    )
+    ); err != nil {
+		return err
+	}
 
-    datastoreDelete(
+    if err := datastoreDelete(
         currentAccessBox.MetadataUUID,
-    )
+    ); err != nil {
+    	return err
+    }
 
     for _, oldChunkUUID := range oldChunkUUIDs {
-        datastoreDelete(oldChunkUUID)
+        if err := datastoreDelete(oldChunkUUID); err != nil {
+        	return err
+        }
     }
 
     return nil

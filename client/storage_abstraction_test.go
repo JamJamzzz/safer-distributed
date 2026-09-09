@@ -72,41 +72,41 @@ var _ = Describe("Storage abstraction", func() {
 
 		id := uuid.New()
 		value := []byte("envelope-bytes")
-		datastoreSet(id, value)
-		got, exists := datastoreGet(id)
+		Expect(datastoreSet(id, value)).To(Succeed())
+
+		got, exists, err := datastoreGet(id)
+		Expect(err).ToNot(HaveOccurred())
 		Expect(exists).To(BeTrue())
 		Expect(got).To(Equal(value))
 
-		datastoreDelete(id)
-		_, exists = datastoreGet(id)
+		Expect(datastoreDelete(id)).To(Succeed())
+		_, exists, err = datastoreGet(id)
+		Expect(err).ToNot(HaveOccurred())
 		Expect(exists).To(BeFalse())
 	})
 
-	Specify("a backend read failure reports absence, never bad bytes", func() {
-		// The wrappers cannot return an error yet, so the one thing they
-		// must not do is hand SAFER's crypto layer bytes the backend told
-		// them not to trust.
+	Specify("a backend failure reaches the caller as an error", func() {
+		// A failure must never be reported as a plain absence: SAFER
+		// treats absence as a meaningful answer, so an outage would
+		// otherwise read as "this file does not exist".
 		withStorage(storage.Storage{Objects: failingObjectStore{}, Keys: failingKeyStore{}}, func() {
-			value, exists := datastoreGet(uuid.New())
-			Expect(exists).To(BeFalse())
-			Expect(value).To(BeNil())
+			_, _, err := datastoreGet(uuid.New())
+			Expect(err).To(MatchError(errBackendDown))
 
-			_, keyExists := keystoreGet("some-key-name")
-			Expect(keyExists).To(BeFalse())
+			Expect(datastoreSet(uuid.New(), []byte("x"))).To(MatchError(errBackendDown))
+			Expect(datastoreDelete(uuid.New())).To(MatchError(errBackendDown))
+
+			_, _, err = keystoreGet("some-key-name")
+			Expect(err).To(MatchError(errBackendDown))
 		})
 	})
 
-	Specify("a backend failure is recorded, not silently discarded", func() {
+	Specify("a failing backend fails SAFER operations instead of corrupting them", func() {
+		// The end-to-end consequence: an unreachable backend must make
+		// InitUser fail outright, not half-create an account.
 		withStorage(storage.Storage{Objects: failingObjectStore{}, Keys: failingKeyStore{}}, func() {
-			datastoreSet(uuid.New(), []byte("x"))
-			Expect(lastStorageFailure()).To(MatchError(errBackendDown))
-			Expect(lastStorageFailure().Error()).To(ContainSubstring("datastoreSet"))
-
-			datastoreDelete(uuid.New())
-			Expect(lastStorageFailure().Error()).To(ContainSubstring("datastoreDelete"))
-
-			datastoreGet(uuid.New())
-			Expect(lastStorageFailure().Error()).To(ContainSubstring("datastoreGet"))
+			_, err := InitUser("storage-failure-user", "password")
+			Expect(err).To(HaveOccurred())
 		})
 	})
 
