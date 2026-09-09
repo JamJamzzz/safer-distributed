@@ -447,6 +447,40 @@ func (lm *LockManager) ReleaseAll(txn TxnID) error {
 	return firstErr
 }
 
+// HeldCount reports how many resources txn currently holds locks on.
+// Diagnostic and reporting only; it takes no part in any locking decision.
+func (lm *LockManager) HeldCount(txn TxnID) int {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return len(lm.held[txn])
+}
+
+// QueueLen reports how many requests are currently waiting (not yet
+// granted) on resource. Diagnostic and reporting only; it takes no part in
+// any locking decision.
+func (lm *LockManager) QueueLen(resource ResourceID) int {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	ls, ok := lm.resources[resource]
+	if !ok {
+		return 0
+	}
+	return len(ls.queue)
+}
+
+// TotalHeldCount reports how many (transaction, resource) locks are held
+// across the whole manager. It is a point-in-time sample for operational
+// visibility, not a synchronization primitive.
+func (lm *LockManager) TotalHeldCount() int {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	total := 0
+	for _, resources := range lm.held {
+		total += len(resources)
+	}
+	return total
+}
+
 // LockGuard is a small transaction-scoped convenience wrapper so that
 // integration call sites (Phase 4+) can write:
 //
