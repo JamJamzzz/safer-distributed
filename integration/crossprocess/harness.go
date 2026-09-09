@@ -40,6 +40,9 @@ const (
 	// workerTimeout bounds one worker's whole run. A worker legitimately
 	// waits behind another's lock, so this is generous.
 	workerTimeout = 90 * time.Second
+	// LeaseDuration is the lease the harness starts its coordinator with.
+	// Tests that wait for a lease to expire wait a multiple of this.
+	LeaseDuration = time.Second
 )
 
 // WorkerResult mirrors the JSON line a worker process prints.
@@ -160,7 +163,21 @@ func Start(t *testing.T) *Cluster {
 func (c *Cluster) startCoordinator(binary string) {
 	c.t.Helper()
 
-	cmd := exec.Command(binary, "-addr", "127.0.0.1:0")
+	cmd := exec.Command(binary,
+		"-addr", "127.0.0.1:0",
+		// Short lease and sweep: these tests turn on a lease expiring,
+		// and the production default would make every one of them wait
+		// six seconds.
+		"-lease", "1s",
+		"-sweep", "100ms",
+	)
+	// The coordinator stores fence state in the same MongoDB the workers
+	// use. Without it there would be no fencing tokens and no
+	// stale-writer protection at all.
+	cmd.Env = append(os.Environ(),
+		mongostore.EnvURI+"="+c.MongoURI,
+		mongostore.EnvDatabase+"="+c.Database,
+	)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		c.t.Fatalf("coordinator stdout: %v", err)
@@ -232,6 +249,20 @@ type WorkerSpec struct {
 	Password string
 	File     string
 	Content  string
+
+	// PauseAt makes the worker stop inside its operation -- holding its
+	// locks, having read the state it is about to mutate, not yet
+	// committed -- when a hook tag contains this substring. Empty means
+	// no pause. See failure.go.
+	PauseAt string
+	// StopRenewalsOnPause stalls the worker's lease renewal at the pause
+	// point without killing it, so the lease can expire while the worker
+	// is still alive and still intending to commit.
+	StopRenewalsOnPause bool
+	// DisableFencing is the negative control: the worker skips fencing
+	// validation at commit, so a test can show the bad write that
+	// fencing is what prevents.
+	DisableFencing bool
 }
 
 // RunConcurrently starts every worker as its own process and releases them
@@ -280,8 +311,9 @@ func (c *Cluster) RunConcurrently(specs ...WorkerSpec) []WorkerResult {
 	return results
 }
 
-// runWorker executes one worker process and decodes its result line.
-func (c *Cluster) runWorker(spec WorkerSpec, barrierAddress string) (WorkerResult, error) {
+// workerCommand builds the process for one worker spec. Every worker gets
+// its own connections, from its own environment.
+func (c *Cluster) workerCommand(spec WorkerSpec, barrierAddress, pauseAddress string) *exec.Cmd {
 	args := []string{
 		"-name", spec.Name,
 		"-op", spec.Op,
@@ -292,13 +324,28 @@ func (c *Cluster) runWorker(spec WorkerSpec, barrierAddress string) (WorkerResul
 		"-barrier", barrierAddress,
 		"-db", c.Database,
 	}
+	if spec.PauseAt != "" {
+		args = append(args, "-pause-at", spec.PauseAt, "-pause-signal", pauseAddress)
+	}
+	if spec.StopRenewalsOnPause {
+		args = append(args, "-stop-renewals-on-pause")
+	}
+	if spec.DisableFencing {
+		args = append(args, "-disable-fencing")
+	}
+
 	cmd := exec.Command(c.workerBinary, args...)
-	// Each worker gets its own connections, from its own environment.
 	cmd.Env = append(os.Environ(),
 		mongostore.EnvURI+"="+c.MongoURI,
 		mongostore.EnvDatabase+"="+c.Database,
 		grpccoord.EnvAddress+"="+c.CoordAddress,
 	)
+	return cmd
+}
+
+// runWorker executes one worker process and decodes its result line.
+func (c *Cluster) runWorker(spec WorkerSpec, barrierAddress string) (WorkerResult, error) {
+	cmd := c.workerCommand(spec, barrierAddress, "")
 
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout

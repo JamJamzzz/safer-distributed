@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/JamJamzzz/safer-distributed/client"
@@ -56,8 +58,25 @@ func main() {
 		content  = flag.String("content", "", "content to write, for append and store")
 		barrier  = flag.String("barrier", "", "barrier address to rendezvous at before the operation")
 		database = flag.String("db", "", "MongoDB database name; overrides SAFER_MONGO_DB")
+
+		// Failure-injection flags, used only by the Phase 3C tests.
+		pauseAt = flag.String("pause-at", "",
+			"pause inside the operation when a hook tag contains this substring")
+		pauseSignal = flag.String("pause-signal", "",
+			"address to announce the pause on, and to wait for a resume line from")
+		stopRenewals = flag.Bool("stop-renewals-on-pause", false,
+			"stop renewing the lease while paused, so it can expire without killing this process")
+		disableFencing = flag.Bool("disable-fencing", false,
+			"NEGATIVE CONTROL ONLY: skip fencing validation at commit")
 	)
 	flag.Parse()
+
+	if *disableFencing {
+		client.DisableFenceValidationForTest(true)
+	}
+	if *pauseAt != "" {
+		installPauseHook(*pauseAt, *pauseSignal, *stopRenewals)
+	}
 
 	res := result{Worker: *name, Op: *op}
 	if err := run(&res, *op, *username, *password, *filename, *content, *barrier, *database); err != nil {
@@ -162,6 +181,62 @@ func run(res *result, op, username, password, filename, content, barrier, databa
 	}
 	res.Version = snapshot.Version
 	res.ChunkCount = snapshot.ChunkCount
+	return nil
+}
+
+// installPauseHook makes the worker stop, deterministically, at a chosen
+// point inside a SAFER operation -- while it holds its locks and has read
+// the state it is about to mutate.
+//
+// That is the moment a worker becomes dangerous: it has computed a
+// mutation against state it believes it owns. Pausing here lets a test
+// kill it, or let its lease expire and then wake it, and see what SAFER
+// does about the write it was about to make. A sleep could not make that
+// schedule reliable.
+func installPauseHook(tag, signalAddress string, stopRenewals bool) {
+	var once sync.Once
+	client.SetTestPauseHook(func(fired string) {
+		if !strings.Contains(fired, tag) {
+			return
+		}
+		once.Do(func() {
+			if stopRenewals {
+				// Stall without dying: still running, still holding the
+				// work it means to commit, but no longer keeping its
+				// lease alive.
+				grpccoord.SuspendHeartbeatsForTest(true)
+			}
+			if signalAddress == "" {
+				return
+			}
+			if err := announceAndWait(signalAddress, fired); err != nil {
+				fmt.Fprintf(os.Stderr, "saferworker: pause rendezvous failed: %v\n", err)
+			}
+		})
+	})
+}
+
+// announceAndWait tells the harness this worker has reached its pause
+// point, then blocks until the harness releases it.
+func announceAndWait(address, tag string) error {
+	conn, err := net.DialTimeout("tcp", address, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("dialing %s: %w", address, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// No read deadline: the harness decides how long the pause lasts, and
+	// a killed worker never returns from here at all.
+	if _, err := fmt.Fprintf(conn, "paused %s\n", tag); err != nil {
+		return fmt.Errorf("announcing the pause: %w", err)
+	}
+	release, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("waiting to be resumed: %w", err)
+	}
+	if strings.TrimSpace(release) != "resume" {
+		return fmt.Errorf("unexpected resume message %q", release)
+	}
 	return nil
 }
 

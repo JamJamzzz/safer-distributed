@@ -1,6 +1,8 @@
 package client
 
 import (
+	"sync/atomic"
+
 	"github.com/JamJamzzz/safer-distributed/client/lockmanager"
 )
 
@@ -79,4 +81,43 @@ func (userdata *User) ReadFileMetadata(filename string) (FileMetadataSnapshot, e
 		Version:    metadata.Version,
 		ChunkCount: metadata.ChunkCount,
 	}, nil
+}
+
+// ---------------------------------------------------------------------
+// Test-only entry points.
+//
+// These exist so that out-of-process tests can build the deterministic
+// schedules the in-package tests build with unexported hooks. A
+// cross-process test cannot reach package internals, and the failure
+// modes Phase 3C has to demonstrate -- a worker killed mid-operation, a
+// worker that stalls and wakes up after losing its lock -- only exist
+// across processes.
+//
+// Nothing in production calls any of these.
+
+// SetTestPauseHook installs a hook fired at fixed points inside SAFER's
+// lock-integrated operations, or clears it with nil.
+//
+// The tag identifies the call site and the resource, so a test can pause
+// exactly one operation at exactly one point: "append:metadata-loaded"
+// fires while the operation holds its locks and has read the state it is
+// about to mutate, which is precisely the moment a stalled worker becomes
+// dangerous.
+func SetTestPauseHook(hook func(tag string)) {
+	setConcurrencyTestHook(hook)
+}
+
+// disableFenceValidation, when set, marks every operation's context so
+// that its storage transaction skips fencing validation.
+//
+// It exists for one test: the negative control that proves fencing is
+// what stops a stale writer. A control that cannot demonstrate the bad
+// commit happening without the check would prove nothing about the check.
+var disableFenceValidation atomic.Bool
+
+// DisableFenceValidationForTest turns fencing validation off for this
+// process. Test-only, and deliberately loud in name: a process with this
+// set has no stale-writer protection at all.
+func DisableFenceValidationForTest(disabled bool) {
+	disableFenceValidation.Store(disabled)
 }

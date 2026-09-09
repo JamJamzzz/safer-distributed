@@ -210,7 +210,12 @@ func operationContext() context.Context { return context.Background() }
 // process a transaction cannot outlive the thing driving it, so there is
 // no stale writer to fence.
 func withFenceGrants(ctx context.Context, guard lockGuardLike) context.Context {
-	return fencing.WithGrants(ctx, coordination.GrantsOf(guard))
+	ctx = fencing.WithGrants(ctx, coordination.GrantsOf(guard))
+	if disableFenceValidation.Load() {
+		// Test-only; see DisableFenceValidationForTest.
+		ctx = fencing.WithoutValidationForTest(ctx)
+	}
+	return ctx
 }
 
 // runAtomicStorage runs fn as one all-or-nothing storage mutation.

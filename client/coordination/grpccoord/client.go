@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,6 +28,10 @@ const (
 	EnvTimeout = "SAFER_COORDINATOR_TIMEOUT"
 )
 
+// minRenewalInterval floors the renewal pace, so a very short lease
+// cannot turn into a renewal storm.
+const minRenewalInterval = 50 * time.Millisecond
+
 // DefaultTimeout bounds connection and Health calls. It deliberately does
 // NOT bound Acquire: a transaction may legitimately wait a long time
 // behind another transaction's lock, and timing that out would turn
@@ -37,10 +42,10 @@ const DefaultTimeout = 10 * time.Second
 type Config struct {
 	Address string
 	Timeout time.Duration
-	// RenewInterval is how often a transaction renews its lease. It
-	// should be a fraction of the coordinator's lease duration, so that
-	// several renewals can be lost before the lease is considered
-	// passed. Defaults to a third of DefaultLeaseDuration.
+	// RenewInterval is only the delay before the FIRST renewal, used
+	// until the coordinator has told this worker a deadline. After that
+	// the pace comes from the lease itself. Defaults to a third of
+	// DefaultLeaseDuration.
 	RenewInterval time.Duration
 }
 
@@ -164,6 +169,21 @@ func (b *Backend) Close() error {
 	return b.conn.Close()
 }
 
+// suspendHeartbeats, when set, makes every guard in this process stop
+// renewing its lease without ending its transaction or dying.
+//
+// It exists for the stale-writer test, which needs a worker that is still
+// running -- still holding computed state it intends to commit -- but
+// whose lease is no longer being kept alive. Killing the process would
+// test something else entirely, and a sleep would not be deterministic.
+var suspendHeartbeats atomic.Bool
+
+// SuspendHeartbeatsForTest stops lease renewal for every transaction in
+// this process. Test-only.
+func SuspendHeartbeatsForTest(suspended bool) {
+	suspendHeartbeats.Store(suspended)
+}
+
 // remoteGuard is one transaction's lock scope against the coordinator.
 type remoteGuard struct {
 	backend *Backend
@@ -188,11 +208,58 @@ type remoteGuard struct {
 	heartbeatStarted bool
 	stopHeartbeat    chan struct{}
 	heartbeatDone    sync.WaitGroup
+	// leaseExpires is the coordinator's authoritative deadline for this
+	// transaction, as of the last response it sent. The renewal interval
+	// is derived from it rather than configured locally: the coordinator
+	// decides how long a lease lasts, and a worker guessing a longer
+	// interval than the real lease would be revoked while perfectly
+	// healthy.
+	leaseExpires time.Time
+
 	// lost is closed if the coordinator ever tells this transaction its
 	// lease is gone, so the worker can find out it no longer holds its
 	// locks.
 	lostOnce sync.Once
 	lost     chan struct{}
+}
+
+// noteLeaseDeadline records the coordinator's latest deadline.
+func (g *remoteGuard) noteLeaseDeadline(unixNano int64) {
+	if unixNano <= 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.leaseExpires = time.Unix(0, unixNano)
+}
+
+// renewalDelay is how long to wait before the next renewal.
+//
+// It is a third of the time actually left on the lease, so two renewals
+// can be lost -- to a GC pause, a slow network, a busy coordinator --
+// before the coordinator considers the lease passed. It is clamped at the
+// bottom so a very short lease cannot turn into a renewal storm, and
+// falls back to a fraction of the default lease if the coordinator has
+// not told us a deadline yet.
+func (g *remoteGuard) renewalDelay() time.Duration {
+	g.mu.Lock()
+	deadline := g.leaseExpires
+	g.mu.Unlock()
+
+	if deadline.IsZero() {
+		return DefaultLeaseDuration / 3
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		// Already past: renew immediately and let the coordinator say
+		// whether the transaction survives.
+		return minRenewalInterval
+	}
+	delay := remaining / 3
+	if delay < minRenewalInterval {
+		delay = minRenewalInterval
+	}
+	return delay
 }
 
 // Acquire blocks until the coordinator grants the lock.
@@ -230,6 +297,8 @@ func (g *remoteGuard) Acquire(resource lockmanager.ResourceID, mode lockmanager.
 	if err != nil {
 		return fmt.Errorf("grpccoord: acquire %s on %v: %w", mode, resource, err)
 	}
+
+	g.noteLeaseDeadline(response.GetLeaseExpiresUnixNano())
 
 	g.mu.Lock()
 	if mode == lockmanager.ExclusiveLock && response.GetFencingToken() != 0 {
@@ -277,48 +346,59 @@ func (g *remoteGuard) Lost() <-chan struct{} { return g.lost }
 
 // heartbeat renews the lease until the transaction ends.
 //
-// The interval is a fraction of the lease so that several renewals can be
-// lost -- to a GC pause, a slow network, a busy coordinator -- before the
-// coordinator considers the lease passed. Renewing at the lease length
-// itself would make every hiccup a revocation.
+// The pace comes from the coordinator, not from local configuration: each
+// response carries the authoritative deadline, and the next renewal is
+// scheduled at a third of the time remaining. A locally configured
+// interval longer than the real lease would get a perfectly healthy
+// worker revoked, which a cross-process test caught doing exactly that.
 func (g *remoteGuard) heartbeat() {
 	defer g.heartbeatDone.Done()
 
-	interval := g.backend.renewInterval
-	if interval <= 0 {
-		interval = DefaultLeaseDuration / 3
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(g.renewalDelay())
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-g.stopHeartbeat:
 			return
-		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), g.backend.timeout)
-			_, err := g.backend.client.RenewLease(ctx, &coordinatorv1.RenewLeaseRequest{
-				TransactionId: g.txn.String(),
-			})
-			cancel()
-			if err == nil {
-				continue
-			}
-			if status.Code(err) == codes.FailedPrecondition {
-				// The coordinator no longer recognizes this transaction
-				// as active: its lease passed and its locks were taken
-				// away. Renewing again cannot help, and fencing will
-				// refuse the commit regardless.
-				g.lostOnce.Do(func() { close(g.lost) })
-				fmt.Fprintf(os.Stderr,
-					"grpccoord: transaction %s lost its lease: %v\n", g.txn, err)
-				return
-			}
-			// A transient failure. Keep trying: the lease may still be
-			// alive, and giving up early would guarantee losing it.
-			fmt.Fprintf(os.Stderr,
-				"grpccoord: renewing the lease for %s failed, will retry: %v\n", g.txn, err)
+		case <-timer.C:
 		}
+
+		if suspendHeartbeats.Load() {
+			// Deliberately stalled: the lease will pass and the
+			// coordinator will revoke, exactly as it would for a worker
+			// that stopped responding.
+			timer.Reset(minRenewalInterval)
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), g.backend.timeout)
+		response, err := g.backend.client.RenewLease(ctx, &coordinatorv1.RenewLeaseRequest{
+			TransactionId: g.txn.String(),
+		})
+		cancel()
+
+		if err == nil {
+			g.noteLeaseDeadline(response.GetLeaseExpiresUnixNano())
+			timer.Reset(g.renewalDelay())
+			continue
+		}
+		if status.Code(err) == codes.FailedPrecondition {
+			// The coordinator no longer recognizes this transaction as
+			// active: its lease passed and its locks were taken away.
+			// Renewing again cannot help, and fencing will refuse the
+			// commit regardless.
+			g.lostOnce.Do(func() { close(g.lost) })
+			fmt.Fprintf(os.Stderr,
+				"grpccoord: transaction %s lost its lease: %v\n", g.txn, err)
+			return
+		}
+		// A transient failure. Keep trying, sooner rather than later:
+		// the lease may still be alive, and giving up would guarantee
+		// losing it.
+		fmt.Fprintf(os.Stderr,
+			"grpccoord: renewing the lease for %s failed, will retry: %v\n", g.txn, err)
+		timer.Reset(minRenewalInterval)
 	}
 }
 
