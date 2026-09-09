@@ -20,6 +20,19 @@
 // Both MongoDB and the coordinator are required at startup: a worker with
 // neither has nothing to persist to and nothing to coordinate through, and
 // parseConfig fails closed rather than starting in a degraded mode.
+//
+// SECURITY: the worker.v1 gRPC surface this process serves is not
+// suitable for exposure to an untrusted network -- see
+// proto/worker/v1/worker.proto's package doc and
+// deploy/kubernetes/networkpolicy.yaml for the full explanation. In
+// short: unlike the lock coordinator's channel, which only ever carries
+// resource identifiers and lock modes, this one carries plaintext
+// usernames, passwords, and file content, over a dial/serve boundary that
+// uses insecure.NewCredentials() -- no transport encryption, no endpoint
+// authentication. Keep this Service ClusterIP/headless and behind a
+// restrictive NetworkPolicy; do not put it behind a LoadBalancer, a
+// NodePort, or an Ingress without a TLS-terminating, authenticating proxy
+// in front of it, none of which this repository provides.
 package main
 
 import (

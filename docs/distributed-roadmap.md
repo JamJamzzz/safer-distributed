@@ -496,11 +496,20 @@ Coordinator: `replicas: 1`, and -- unlike the default -- `strategy: Recreate`,
 independent in-memory lock table, silently splitting coordination between workers
 with no error to signal it. `Recreate` tears the old pod down before the new one
 starts, so every coordinator rollout has a brief real coordination outage. That is
-the deliberate trade: deployment availability for coordination safety. This is not
-high availability, and Phase 4 adds no leader election or consensus to make it one --
-the single coordinator remains the same explicit failure domain Phase 3A through 3C
-already documented, just now with an honest rollout policy instead of a rolling
-update that would make the failure mode worse.
+the deliberate trade: deployment availability for coordination safety.
+
+**Precisely what `Recreate` does and does not earn, stated plainly so it is not
+overread:** it earns exactly one property -- that no two coordinator lock tables ever
+run at once, which is what a rolling update could not guarantee. It earns nothing
+else. It does **not** make a coordinator restart fault-tolerant, and it does **not**
+preserve in-flight lock state across the restart -- the old pod's in-memory lock
+table is gone the moment it terminates, same as an unplanned crash, whether that
+termination came from `kubectl rollout` or from something killing the pod
+unexpectedly. A coordinator restart, planned or not, remains the same explicit,
+unsupported failure boundary Phase 3A through 3C already documented: this is not high
+availability, and nothing added in Phase 4 -- no leader election, no consensus, no
+Raft -- changes that. `Recreate` is a rollout-safety property, not a substitute for
+the coordinator fault tolerance this repository deliberately does not build.
 
 Configuration: a `ConfigMap` for non-sensitive settings (coordinator address,
 database name, timeout settings) and a `Secret` for MongoDB credentials. The
@@ -511,15 +520,25 @@ development defaults, not derived from any benchmark -- `cmd/loadgen` is
 functional/correctness tooling at this phase, not a sizing tool.
 
 Network isolation: a `default-deny-ingress` NetworkPolicy plus two scoped allows, so
-the coordinator is reachable only from worker pods and workers only from within the
-namespace. This restricts *which pods* can reach these services at the network
-layer; it does not add the cryptographic service authentication the coordinator's
-gRPC transport still lacks (unchanged from Phase 3A -- see "Cross-process
-coordination" above). Building mTLS or any other service-authentication layer is out
-of scope for this phase. An optional, unapplied NetworkPolicy template covers the
-case where MongoDB itself runs as an in-cluster pod; this repository does not deploy
-MongoDB at all (it is a managed/external dependency, the same way CI runs it from the
-upstream `mongo:7` image rather than a custom build).
+the coordinator is reachable only from worker pods, and workers only from pods
+carrying an opt-in `safer-client: "true"` label (`loadgen-job.yaml` carries it) --
+not from the whole namespace, which an earlier version of this policy allowed. That
+distinction matters because the two channels are not equally risky: the coordinator's
+channel (unchanged from Phase 3A -- see "Cross-process coordination" above) carries
+only resource identifiers and lock modes, since SAFER encrypts and authenticates its
+objects before anything reaches storage or the lock layer. The worker's channel
+(`proto/worker/v1/worker.proto`) is a NEW, higher-risk boundary Phase 4 introduced: it
+sits *before* that encryption layer, so every request carries the caller's plaintext
+username and password, and StoreFile/AppendToFile carry plaintext file content, over
+a transport that -- like the coordinator's -- is neither encrypted nor authenticated
+at the application layer. **The worker gRPC surface is not suitable for exposure to
+an untrusted network.** NetworkPolicy restricts *which pods* can reach it; it is not
+cryptographic authentication of what an already-admitted pod sends, and building mTLS
+or any other service-authentication layer remains out of scope for this phase. An
+optional, unapplied NetworkPolicy template covers the case where MongoDB itself runs
+as an in-cluster pod; this repository does not deploy MongoDB at all (it is a
+managed/external dependency, the same way CI runs it from the upstream `mongo:7`
+image rather than a custom build).
 
 ### Load generator
 
@@ -606,11 +625,14 @@ and what was only reviewed.
 
 Recorded here so they are not asserted prematurely:
 
-- **Cross-process strict 2PL plus atomic durable MongoDB mutations, under graceful
-  operation only.** Earned: strict 2PL across separate OS processes sharing one
-  coordinator and one database, and all-or-nothing multi-object persistence, both
-  verified by real multi-process/failure-injection tests with negative controls. Not
-  earned: any behavior under worker crashes, coordinator crashes, or partitions.
+- **Cross-process strict 2PL plus atomic durable MongoDB mutations.** Earned: strict
+  2PL across separate OS processes sharing one coordinator and one database, and
+  all-or-nothing multi-object persistence, both verified by real multi-process/
+  failure-injection tests with negative controls. This bullet originally added "under
+  graceful operation only" and said worker-crash behavior was not earned; Phase 3C
+  earned it (see the next bullet), so that qualifier no longer applies here. What is
+  still not earned by anything in this repository: coordinator crashes or network
+  partitions (see the following bullets).
 - **Worker crash recovery, bounded lock reclamation, and stale-writer protection are
   earned** as of Phase 3C, verified with real killed and stalled processes and a
   negative control. "Bounded" means bounded by the lease, plus however long fence
@@ -622,16 +644,24 @@ Recorded here so they are not asserted prematurely:
   Solving that needs replication and consensus, deliberately out of scope.
 - **No claim about network partitions.** Nothing has been tested against a partition
   between a worker and the coordinator while storage stays reachable.
-- **Durability, plus atomicity of failed mutations.** Verified: data written through
-  one SAFER client and connection pool is readable through a separate one afterwards,
-  and a mutation that fails part way leaves no committed partial state. Not verified:
-  crash consistency — a killed process mid-commit is not the same as a returned error,
-  and there are no kill tests.
-- **No fault-tolerance claim** — failure testing covers an injected failing storage
-  backend, an unreachable one, an unreachable coordinator at startup, and cancelled or
-  abandoned lock requests. There is no kill-the-database, kill-the-coordinator,
-  kill-the-worker, or partition testing, and no lease or fencing machinery to make such
-  tests meaningful yet. That is Phase 3C.
+- **Durability, plus atomicity of failed mutations — but not MongoDB crash
+  consistency.** Verified: data written through one SAFER client and connection pool
+  is readable through a separate one afterwards, and a mutation that fails part way
+  (an injected storage error, or -- as of Phase 4.5 -- a context deadline; see
+  `integration/context_deadline_test.go`) leaves no committed partial state. Not
+  verified: a killed **MongoDB** process mid-commit, which is a different scope from
+  worker crashes and is not the same as a returned error. This bullet is about the
+  storage layer specifically; it does not contradict worker-crash recovery below,
+  which Phase 3C does cover.
+- **No kill-the-database or kill-the-coordinator testing.** Kill-the-**worker**
+  testing, and the lease/fencing machinery that makes it meaningful, are done (Phase
+  3C -- see the bullet above and "Worker failure" earlier in this document). An
+  earlier version of this bullet said there was no kill-worker testing and no lease/
+  fencing machinery at all, ending "That is Phase 3C" as if the phase were still
+  pending; it was written before Phase 3C existed and was never updated once it did.
+  What remains genuinely untested is narrower: a killed MongoDB process or a killed
+  coordinator process specifically (network partitions are the separate bullet
+  above).
 - The checked-in benchmark tables are inherited historical SAFER-CC measurements, not
   performance claims about this repository.
 - **No live Kubernetes verification.** Phase 4's manifests are statically validated
@@ -644,12 +674,19 @@ Recorded here so they are not asserted prematurely:
   all three Docker images together on a plain Docker network against real MongoDB
   (`docker/README.md`), and the equivalent multi-process topology through Go
   integration tests (`integration/workerservice`).
-- **No cryptographic service authentication.** The coordinator's gRPC transport is
-  still unauthenticated at the application layer, unchanged from Phase 3A. Phase 4's
-  NetworkPolicies restrict *which pods* can reach the coordinator and workers at the
-  network layer; they do not authenticate *what* an already-allowed pod sends. Building
-  mTLS or another service-authentication layer is explicitly out of scope for this
-  phase.
+- **No cryptographic service authentication, and the worker channel is genuinely
+  higher-risk than the coordinator's.** Neither gRPC transport is authenticated or
+  encrypted at the application layer. The coordinator's channel, unchanged from Phase
+  3A, carries only resource identifiers and lock modes. The worker's channel
+  (`proto/worker/v1/worker.proto`, added in Phase 4.1) is a different and worse
+  exposure: it sits before SAFER's encryption layer, so it carries the caller's
+  plaintext username and password on every request, and plaintext file content on
+  writes. Phase 4.5's NetworkPolicies restrict *which pods* can reach each channel
+  (an opt-in label for the worker's, tighter than the coordinator's own-namespace
+  scope, reflecting that difference in risk); they do not authenticate or encrypt
+  *what* an already-allowed pod sends. The worker gRPC surface is explicitly not
+  suitable for exposure to an untrusted network as a result. Building mTLS or another
+  service-authentication layer remains out of scope for this phase.
 - **No production sizing.** The CPU/memory requests and limits in
   `deploy/kubernetes/` are conservative development defaults, not derived from any
   load test. `cmd/loadgen` validates functional correctness under concurrency in this

@@ -1,21 +1,45 @@
 # Network isolation for Phase 4.5.
 #
-# The coordinator's gRPC transport is unauthenticated at the application
-# layer (see client/coordination/grpccoord's package doc): SAFER's objects
-# are encrypted and authenticated before anything reaches storage, so this
-# channel carries no plaintext content and no key material, only resource
-# identifiers and lock modes -- but nothing stops a pod that can merely
-# REACH the coordinator from forging lock traffic. Phase 4 does not build
-# mTLS or any other cryptographic service authentication for it (out of
-# scope for this phase); instead these NetworkPolicies restrict WHICH pods
-# can reach the coordinator and the workers at the network layer.
+# Two DIFFERENT channels here carry very different risk if reached by an
+# unintended pod, and this file's two allow rules are sized accordingly.
+# Neither channel has transport encryption or endpoint authentication
+# (both dial insecure.NewCredentials(); see client/coordination/grpccoord's
+# package doc and cmd/worker's), so what follows is entirely about
+# restricting WHICH pods can reach each one at the network layer -- not
+# about encrypting or authenticating what an already-allowed pod sends,
+# which stays out of scope for this phase (no mTLS/PKI project here).
 #
-# What this earns: a workload elsewhere in the cluster cannot reach the
-# coordinator or the workers at all. What it does NOT earn: authentication
-# of traffic that legitimately originates from an allowed pod. The
-# remaining trust assumption is explicit -- a trusted Kubernetes cluster
-# network and authorized pods within this namespace -- and is not claimed
-# to be equivalent to cryptographic authentication.
+#   - The COORDINATOR channel (client/coordination/grpccoord) carries only
+#     resource identifiers and lock modes. SAFER encrypts and
+#     authenticates its objects before anything reaches storage or the
+#     lock layer, so this channel never carries plaintext file content or
+#     credentials. A pod that can reach it could forge lock traffic and
+#     disrupt correctness/availability, but it learns nothing confidential
+#     by doing so.
+#
+#   - The WORKER channel (worker.v1, proto/worker/v1/worker.proto) is a
+#     DIFFERENT and HIGHER-RISK boundary that did not exist before Phase 4:
+#     it sits BEFORE SAFER's encryption layer, not after it. Every
+#     InitUser/StoreFile/AppendToFile/LoadFile request carries the
+#     caller's plaintext username and password (SAFER derives keys from
+#     them per-call; see client.GetUserContext), and StoreFile/
+#     AppendToFile carry plaintext file content the worker has not
+#     encrypted yet. A pod that can reach the worker Service and is
+#     handed (or guesses) a real username/password can read and write
+#     that user's files, and anything that can merely observe this
+#     channel's bytes -- which NetworkPolicy does not prevent for an
+#     ALLOWED pod, only for a disallowed one -- sees them in the clear.
+#     THE WORKER gRPC SURFACE IS NOT SUITABLE FOR EXPOSURE TO AN
+#     UNTRUSTED NETWORK. Keeping it ClusterIP/headless (never a
+#     LoadBalancer or NodePort Service, and never behind an Ingress
+#     without a TLS-terminating, authenticating proxy in front of it,
+#     neither of which this repository adds) and restricting its ingress
+#     as tightly as the deployment can tolerate (see worker-ingress below)
+#     are the only mitigations this phase applies. NetworkPolicy is
+#     access control at the network layer, not encryption and not
+#     cryptographic identity -- it does not make this channel safe to
+#     expose beyond a trusted cluster network, it only narrows who is on
+#     that network.
 #
 # default-deny-ingress makes the allow rules below meaningful: without it,
 # any pod that could reach the namespace's pod network at all would reach
@@ -54,9 +78,15 @@ spec:
         - protocol: TCP
           port: 50051
 ---
-# Workers are the intended point of contact for clients (loadgen, and any
-# real caller), so their ingress is scoped to this namespace rather than
-# to one named caller -- but still not open to the whole cluster.
+# Workers carry the higher-risk channel described above, so their ingress
+# is narrowed to pods that opt in with the safer-client: "true" label,
+# not to the whole namespace. loadgen-job.yaml carries this label; any
+# other legitimate caller in this namespace adds the same label to its
+# own pod template rather than being granted access implicitly by
+# residing in the namespace. This is a labeling convention, not a named
+# allowlist of specific pods -- it does not require editing this policy
+# every time a new caller is added, and it does not "make the deployment
+# unusable": any real client is one label away from working.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -70,9 +100,9 @@ spec:
     - Ingress
   ingress:
     - from:
-        - namespaceSelector:
+        - podSelector:
             matchLabels:
-              kubernetes.io/metadata.name: safer-distributed
+              safer-client: "true"
       ports:
         - protocol: TCP
           port: 50052

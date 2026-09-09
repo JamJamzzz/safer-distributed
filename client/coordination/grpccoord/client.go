@@ -83,6 +83,13 @@ func ConfigFromEnv() (cfg Config, configured bool, err error) {
 // this channel could still disrupt availability and correctness by forging
 // lock traffic, so it is not safe to expose across an untrusted network as
 // it stands.
+//
+// This is the LOWER-risk of the two insecure gRPC channels in this
+// deployment. Contrast cmd/worker's worker.v1 surface (see
+// proto/worker/v1/worker.proto's package doc), which carries plaintext
+// usernames, passwords, and file content, since it sits before SAFER's
+// encryption layer rather than after it -- reaching that channel is a
+// meaningfully bigger problem than reaching this one.
 type Backend struct {
 	conn    *grpc.ClientConn
 	client  coordinatorv1.LockCoordinatorClient

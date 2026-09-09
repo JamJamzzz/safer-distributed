@@ -14,6 +14,12 @@
 #   kubectl apply -f deploy/kubernetes/loadgen-job.yaml
 #   kubectl logs -n safer-distributed job/safer-loadgen -f
 #   kubectl delete -f deploy/kubernetes/loadgen-job.yaml   # before re-running
+#
+# The safer-client: "true" pod label is what networkpolicy.yaml's
+# worker-ingress rule actually admits -- see that file's header comment
+# for why worker ingress is scoped to labeled clients rather than the
+# whole namespace. Any other real caller in this namespace needs the same
+# label on its own pod template to reach the worker Service at all.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -22,6 +28,9 @@ metadata:
 spec:
   backoffLimit: 0
   template:
+    metadata:
+      labels:
+        safer-client: "true"
     spec:
       restartPolicy: Never
       containers:

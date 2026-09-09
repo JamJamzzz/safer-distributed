@@ -5,12 +5,18 @@
 // directory's README.md for exactly what was and was not verified against
 // a live Kubernetes API server, which is nothing: no cluster was available
 // in the environment this was written in (no kind/minikube, no Docker
-// Desktop Kubernetes context). What this test does check is real, just
-// narrower: `kubectl kustomize` parses every manifest, resolves
-// cross-references (a Deployment's envFrom naming a ConfigMap/Secret that
-// actually exists, a Service's selector actually matching a Deployment's
-// pod labels), and produces the resource set a real `kubectl apply -k`
-// would submit.
+// Desktop Kubernetes context).
+//
+// What this file's own tests check is narrower than that: `kubectl
+// kustomize` parses every manifest and produces the resource set a real
+// `kubectl apply -k` would submit, and TestKustomizationBuilds greps that
+// output for the specific resources and settings this repository's docs
+// make claims about. Plain string-containment does NOT resolve
+// cross-references on its own -- kustomize is a template/overlay tool, it
+// does not check that a Service's selector actually matches any
+// Deployment's pod labels, or that a Deployment's envFrom actually names
+// a ConfigMap/Secret that exists. crossref_test.go is what actually
+// checks those two things, by parsing the rendered YAML.
 package kubernetes
 
 import (
@@ -60,6 +66,12 @@ func TestKustomizationBuilds(t *testing.T) {
 		// it back into an ordinary Service that resolves to one IP.
 		"name: safer-worker-headless",
 		"clusterIP: None",
+		// worker-ingress (Phase 4.5) is scoped to labeled clients, not the
+		// whole namespace, because the worker channel carries plaintext
+		// credentials and file content (see networkpolicy.yaml's header
+		// comment) -- losing this selector would silently widen ingress
+		// back to every pod in the namespace.
+		`safer-client: "true"`,
 	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("kustomize output does not contain %q", want)
@@ -88,6 +100,15 @@ func TestStandaloneManifestsParse(t *testing.T) {
 			output := runKustomize(t, dir)
 			if !strings.Contains(output, "namespace: safer-distributed") {
 				t.Errorf("%s: kustomize output missing namespace: safer-distributed:\n%s", file, output)
+			}
+			if file == "loadgen-job.yaml" {
+				// The label networkpolicy.yaml's worker-ingress rule
+				// actually admits (Phase 4.5): losing it silently would
+				// mean the Job's own pod can no longer reach the worker
+				// Service under the tightened NetworkPolicy.
+				if !strings.Contains(output, `safer-client: "true"`) {
+					t.Errorf("%s: missing the safer-client=true label worker-ingress requires:\n%s", file, output)
+				}
 			}
 		})
 	}

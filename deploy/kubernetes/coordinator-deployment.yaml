@@ -11,9 +11,15 @@
 #     above. Recreate tears down the old pod before creating the new one,
 #     so there is a real (if brief) coordination outage during every
 #     coordinator rollout -- deployment availability is traded for
-#     coordination safety. This is not high availability, and no leader
-#     election or consensus is added to make it one (out of scope; see
-#     the roadmap).
+#     coordination safety.
+#
+# Recreate earns exactly the no-overlap property above and nothing more:
+# it does NOT make a coordinator restart fault-tolerant, and it does NOT
+# preserve in-flight lock state across the restart -- the old pod's
+# in-memory lock table is gone the instant it terminates, identically to
+# an unplanned crash. This is not high availability, and no leader
+# election, consensus, or Raft is added to make it one (out of scope; see
+# the roadmap).
 apiVersion: apps/v1
 kind: Deployment
 metadata:

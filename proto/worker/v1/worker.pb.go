@@ -22,6 +22,26 @@
 // server-side session state (see client.GetUser), so the worker itself
 // holds no per-user state between requests and any replica can serve any
 // request.
+//
+// SECURITY: this channel is NOT suitable for exposure to an untrusted
+// network, and is meaningfully higher-risk than the lock coordinator's
+// channel (proto/coordinator/v1). The coordinator only ever carries
+// resource identifiers and lock modes, because SAFER encrypts and
+// authenticates its objects before anything reaches storage or the lock
+// layer. This service sits BEFORE that encryption: every request here
+// carries the caller's PLAINTEXT username and password, and StoreFile/
+// AppendToFile carry PLAINTEXT file content the worker has not encrypted
+// yet. Like the coordinator, cmd/worker dials and serves this
+// insecure.NewCredentials() -- no transport encryption, no endpoint
+// authentication -- so anything that can observe or reach this channel
+// sees these bytes in the clear and can act as any user it can
+// authenticate as. Restricting network reachability (a ClusterIP/
+// headless Service, never a LoadBalancer/NodePort or a bare Ingress; see
+// deploy/kubernetes/networkpolicy.yaml's worker-ingress rule) is the only
+// mitigation this phase applies; it is access control at the network
+// layer, not encryption or cryptographic identity, and does not make this
+// channel safe to expose beyond a trusted cluster network. Building
+// mTLS/PKI for this channel is out of scope for this phase.
 
 package workerv1
 

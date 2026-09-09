@@ -103,20 +103,49 @@ in-memory lock table, splitting coordination between workers -- silently,
 since nothing about strict 2PL detects a second lock authority existing.
 `Recreate` tears the old pod down before the new one starts, trading
 deployment availability (a brief coordination outage on every coordinator
-rollout) for coordination safety. This is not high availability, and nothing
-here adds leader election or consensus to make it one.
+rollout) for coordination safety.
+
+`Recreate` earns exactly that one property -- no overlap -- and nothing more. It
+does **not** make a coordinator restart fault-tolerant, and it does **not** preserve
+in-flight lock state across the restart: the old pod's in-memory lock table is gone
+the instant it terminates, identically to an unplanned crash. This is not high
+availability, and nothing here adds leader election, consensus, or Raft to make it
+one.
 
 ## Network isolation
 
 See `networkpolicy.yaml`'s header comment for the full reasoning. Short
 version: `default-deny-ingress` plus two allow rules mean the coordinator
 is reachable only from worker pods, and workers are reachable only from
-within the `safer-distributed` namespace. This is network-layer
-restriction of *which pods* can reach these services, not cryptographic
-authentication of *what they send* once they can -- the coordinator's gRPC
-transport itself remains unauthenticated at the application layer (see
-`client/coordination/grpccoord`'s package doc), and building mTLS or any
-other service-authentication layer is out of scope for this phase.
+pods carrying the `safer-client: "true"` label (see `loadgen-job.yaml`,
+which carries it). This is network-layer restriction of *which pods* can
+reach these services, not cryptographic authentication of *what they
+send* once they can -- neither the coordinator's nor the worker's gRPC
+transport is encrypted or authenticated at the application layer, and
+building mTLS or any other service-authentication layer is out of scope
+for this phase.
+
+**The two channels are not equally risky, and the NetworkPolicies are not
+sized the same for that reason.** The coordinator's channel
+(`client/coordination/grpccoord`'s package doc) carries only resource
+identifiers and lock modes -- SAFER encrypts and authenticates its
+objects before anything reaches storage or the lock layer, so there is no
+plaintext content or credentials on that wire regardless of who reaches
+it. The worker's channel (`proto/worker/v1/worker.proto`'s package doc,
+`cmd/worker`'s) is different: it sits *before* that encryption layer, so
+every request carries the caller's plaintext username and password, and
+StoreFile/AppendToFile carry plaintext file content. That is why
+`worker-ingress` is scoped to an opt-in label rather than the whole
+namespace the way an earlier version of this policy had it -- **the
+worker gRPC surface is not suitable for exposure to an untrusted
+network**, and namespace-wide ingress was wider than that risk warrants.
+Any pod that legitimately needs to reach the worker Service adds the
+`safer-client: "true"` label to its own pod template; this is a
+convention, not a hardcoded allowlist, so it does not need editing here
+as new callers are added. None of this is cryptographic identity or
+transport encryption -- it narrows *who is on the network*, not what an
+already-admitted pod can see.
+
 `networkpolicy-mongo-optional.yaml` is a template for the case where
 MongoDB itself runs as an in-cluster pod; it is not applied by
 `kustomization.yaml` because this repository's manifests do not deploy
