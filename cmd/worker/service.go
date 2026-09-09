@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -159,8 +160,16 @@ func authenticate(ctx context.Context, limiter *authLimiter, username, password 
 			return err
 		}
 		defer limiter.release()
+		// Timed separately from the span above, and starting only here:
+		// safer.worker.auth_compute.duration is defined as the
+		// post-admission work alone, so the admission wait that
+		// limiter.acquire just finished is deliberately outside it (see
+		// authlimit.go). A caller cancelled while queued returns above and
+		// records no compute observation.
+		computeStart := time.Now()
 		var err error
 		user, err = client.GetUserContext(ctx, username, password)
+		recordAuthCompute(ctx, computeStart, err)
 		return err
 	})
 	if err != nil {

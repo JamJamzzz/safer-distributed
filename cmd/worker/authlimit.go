@@ -67,7 +67,56 @@ var (
 		"safer.worker.auth_admission.in_flight",
 		metric.WithDescription("Number of GetUserContext/InitUserContext calls currently holding an authLimiter slot."),
 	)
+
+	// authComputeDuration is the deliberate complement to
+	// authAdmissionWait: the wait histogram stops the instant a slot is
+	// acquired, so it says nothing at all about how long the work itself
+	// then took. This one measures ONLY that work -- the
+	// client.GetUserContext call, key derivation included -- once a slot
+	// has already been granted.
+	//
+	// The two are kept as separate direct measurements on purpose. Total
+	// authentication time is wait + compute, but that decomposition is
+	// only meaningful per request: subtracting one aggregate histogram
+	// from another (different denominators, different distributions) does
+	// not yield "the compute part" of anything. Recording compute directly
+	// avoids ever needing that subtraction.
+	//
+	// The worker.authenticate span still covers the whole helper and
+	// remains the right thing to read for one retained trace. This exists
+	// because indexed spans are a sampled subset, so they cannot support
+	// benchmark-wide distributions; metrics are not sampled.
+	//
+	// NOT an InitUser metric: InitUser does its own, different, expensive
+	// key generation (RSA/DS), and its handler takes an authLimiter slot
+	// directly rather than going through authenticate. It is deliberately
+	// excluded so this histogram describes exactly one population -- the
+	// GetUserContext path used by StoreFile, AppendToFile and LoadFile.
+	authComputeDuration, _ = authMeter.Float64Histogram(
+		"safer.worker.auth_compute.duration",
+		metric.WithDescription("Duration of the post-admission client.GetUserContext authentication call (StoreFile/AppendToFile/LoadFile only; excludes authLimiter queue wait and excludes InitUser key generation)."),
+		metric.WithUnit("s"),
+	)
 )
+
+// recordAuthCompute records one observation of the post-admission
+// authentication compute section. It is called exactly where
+// GetUserContext returns, so a request cancelled while still queued for a
+// slot produces an admission-wait "cancelled" observation and no compute
+// observation at all -- the work never started, and inventing a zero for
+// it would corrupt the distribution.
+//
+// outcome is a fixed two-value enum. The error itself is never attached:
+// an error string is unbounded cardinality, and the reason a credential
+// check failed is not something a metric label should carry.
+func recordAuthCompute(ctx context.Context, start time.Time, err error) {
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	authComputeDuration.Record(ctx, time.Since(start).Seconds(),
+		metric.WithAttributes(attribute.String("outcome", outcome)))
+}
 
 // authLimiter bounds how many expensive authentication/key-derivation
 // sections run concurrently in this worker process.

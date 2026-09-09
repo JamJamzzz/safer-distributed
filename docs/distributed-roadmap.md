@@ -857,6 +857,7 @@ trust-boundary reasoning Phase 4.5 applied to the worker gRPC channel.
 | `safer.coordinator.lock.wait.duration` | histogram (s) | `lock.mode`, `resource.type`, `outcome` | how long callers actually wait for a lock |
 | `safer.worker.auth_admission.wait.duration` | histogram (s) | `outcome` | authLimiter queueing delay |
 | `safer.worker.auth_admission.in_flight` | up-down counter | -- | live auth-admission saturation |
+| `safer.worker.auth_compute.duration` | histogram (s) | `outcome` | post-admission `GetUserContext` duration |
 | `safer.coordinator.lease.revocation.count` | counter | -- | stale-lease revocations |
 | `safer.coordinator.fence.cleanup.retry.count` | counter | -- | fence cleanup retry pressure |
 | `safer.coordinator.fence.cleanup.failure.count` | counter | -- | fence cleanup giving up |
@@ -864,8 +865,63 @@ trust-boundary reasoning Phase 4.5 applied to the worker gRPC channel.
 | `safer.storage.fence.rejection.count` | counter | -- | stale-fence rejections inside storage |
 
 `outcome` values are deliberately small, fixed enums (`granted`/`caller_cancelled`/
-`revoked`/`failed`, `acquired`/`cancelled`, `committed`/`error`), never a raw error
-string or identifier.
+`revoked`/`failed`, `acquired`/`cancelled`, `committed`/`error`, `success`/`error`),
+never a raw error string or identifier.
+
+#### The three authentication measurements are not interchangeable
+
+Authentication is measured in three places with three different scopes, and
+conflating them produces wrong answers, so they are stated exactly:
+
+- **`safer.worker.auth_admission.wait.duration`** — the **queue/admission wait
+  only**. It is recorded the instant an `authLimiter` slot is acquired, which is
+  *before* `GetUserContext` runs, so it says nothing whatsoever about how long
+  authentication work itself took.
+- **`safer.worker.auth_compute.duration`** — the **post-admission
+  `client.GetUserContext` call**, key derivation included, and nothing else. It
+  excludes the admission wait above, the username/password field validation, and
+  everything after authentication (`safer.<Operation>`, lock acquisition, the
+  Mongo transaction). It covers only the `StoreFile`/`AppendToFile`/`LoadFile`
+  path: `InitUser` performs different (RSA/DS) key generation and takes its
+  limiter slot directly rather than through `authenticate`, so it is deliberately
+  **not** in this histogram.
+- **`worker.authenticate` span** — total wall-clock of the whole authentication
+  helper (admission wait *plus* compute) for one **retained** trace.
+
+Total authentication time is admission wait plus compute, but that decomposition
+is only meaningful **per request**. Subtracting one aggregate histogram from
+another — different denominators, different distributions — does not yield "the
+compute part" of anything, which is precisely why compute is now measured
+directly rather than inferred. Metrics are unsampled; indexed spans are not (see
+below), so the span remains the right thing to read for a single trace and the
+histograms are the right thing to read for a distribution.
+
+### Unsampled load-generator latency
+
+`cmd/loadgen` records one latency sample per **successful** timed workload
+operation and reports `latency_samples`, `p50`, `p95` and `p99` on its own output
+line. The measured window is exactly the workload operation: setup (`InitUser`
+and the initial `StoreFile`), the post-run oracle verification, process startup
+and the gRPC dial are all outside it. Failed operations are still counted in
+`failed` and still surface in `error:` lines, but contribute no latency sample —
+a failed call is frequently a timeout and would otherwise dominate a distribution
+labelled as successful-operation latency, so `latency_samples == succeeded` for a
+normally completed run.
+
+This exists because Datadog's **indexed** APM spans are a retained subset rather
+than a complete record: a 200-operation run was observed contributing
+substantially fewer indexed spans than it executed. Retained traces remain the
+right tool for trace shape, causal debugging and specific tail examples; they
+cannot support benchmark-wide percentiles. These loadgen numbers describe this
+development deployment under one run's load and are not production latency
+figures.
+
+Worker CPU throttling has also been observed on the `safer-worker` pods during a
+benchmark window (`kubernetes.cpu.cfs.throttled.seconds` / `.periods`, filtered to
+`kube_namespace:safer-distributed`), which is why the final evidence pass must
+record CPU throttling alongside latency rather than reading latency alone. That
+observation is motivation for the measurement design; no causal claim about what
+share of authentication latency it accounts for is made or implied here.
 
 ### Logging
 
