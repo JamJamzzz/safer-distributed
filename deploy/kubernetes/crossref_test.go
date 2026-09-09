@@ -57,6 +57,11 @@ func stringField(m map[string]interface{}, key string) string {
 	return s
 }
 
+func boolField(m map[string]interface{}, key string) bool {
+	b, _ := m[key].(bool)
+	return b
+}
+
 func mapField(m map[string]interface{}, key string) map[string]interface{} {
 	sub, _ := m[key].(map[string]interface{})
 	return sub
@@ -177,15 +182,21 @@ func TestEnvFromReferencesExist(t *testing.T) {
 				if cmRef := mapField(entry, "configMapRef"); cmRef != nil {
 					checked++
 					name := stringField(cmRef, "name")
-					if !known["ConfigMap/"+name] {
-						t.Errorf("Deployment %q references ConfigMap %q, which does not exist", nameOf(r), name)
+					// optional: true (deploy/kubernetes/telemetry/otel-config.yaml,
+					// referenced this way precisely because it is allowed
+					// to be absent -- see that file's own doc) is not
+					// required to resolve; only a REQUIRED reference to a
+					// missing ConfigMap is the broken-cross-reference bug
+					// this test exists to catch.
+					if !boolField(cmRef, "optional") && !known["ConfigMap/"+name] {
+						t.Errorf("Deployment %q references required ConfigMap %q, which does not exist", nameOf(r), name)
 					}
 				}
 				if secretRef := mapField(entry, "secretRef"); secretRef != nil {
 					checked++
 					name := stringField(secretRef, "name")
-					if !known["Secret/"+name] {
-						t.Errorf("Deployment %q references Secret %q, which does not exist", nameOf(r), name)
+					if !boolField(secretRef, "optional") && !known["Secret/"+name] {
+						t.Errorf("Deployment %q references required Secret %q, which does not exist", nameOf(r), name)
 					}
 				}
 			}

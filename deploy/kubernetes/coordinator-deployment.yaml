@@ -59,6 +59,13 @@ spec:
                 name: safer-config
             - secretRef:
                 name: safer-mongo-credentials
+            # Telemetry-backend configuration, deliberately a separate
+            # ConfigMap -- see deploy/kubernetes/telemetry/otel-config.yaml
+            # and worker-deployment.yaml's matching comment. Optional: its
+            # absence just means no telemetry is exported.
+            - configMapRef:
+                name: safer-otel-config
+                optional: true
           readinessProbe:
             grpc:
               port: 50051

@@ -44,6 +44,16 @@ spec:
                 name: safer-config
             - secretRef:
                 name: safer-mongo-credentials
+            # Telemetry-backend configuration, deliberately a separate
+            # ConfigMap from safer-config -- see
+            # deploy/kubernetes/telemetry/otel-config.yaml. Optional by
+            # construction (internal/telemetry's package doc): if this
+            # ConfigMap is absent or its OTEL_EXPORTER_OTLP_ENDPOINT key
+            # is unset, the worker starts and serves exactly as it did
+            # before Phase 5, with no telemetry exported anywhere.
+            - configMapRef:
+                name: safer-otel-config
+                optional: true
           # Readiness and liveness are deliberately different checks (see
           # cmd/worker/health.go).
           #

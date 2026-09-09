@@ -1,0 +1,44 @@
+# Telemetry-BACKEND configuration, deliberately kept separate from
+# ../configmap.yaml (SAFER's own application settings): the application
+# code (internal/telemetry, and every instrumentation call site built on
+# it) depends only on the OpenTelemetry API/SDK/exporters and the
+# standard OTEL_EXPORTER_OTLP_* environment variables -- never on a
+# Datadog-specific library or endpoint shape. This file is what points
+# those standard variables at a Datadog Agent's OTLP receiver in THIS
+# cluster; swapping to a different OTLP-compatible backend, or to no
+# backend at all, means editing (or deleting) only this file.
+#
+# The endpoint below assumes a Datadog Agent (Helm chart or, as in the
+# environment this was developed and verified against, the Datadog
+# Operator's DatadogAgent custom resource) already running in a
+# `datadog` namespace with its OTLP gRPC receiver enabled -- i.e.
+#
+#   spec.features.otlp.receiver.protocols.grpc.enabled: true
+#
+# on the DatadogAgent CR (see deploy/kubernetes/telemetry/README.md for
+# how to check and enable this without reinstalling the Agent). This
+# repository does not install or manage the Datadog Agent itself -- same
+# reasoning as MongoDB not getting a manifest here (see docker/README.md):
+# it is a managed, pre-existing dependency of the deployment, not
+# something SAFER's own manifests own the lifecycle of.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: safer-otel-config
+  namespace: safer-distributed
+data:
+  # The Datadog Agent's OTLP gRPC receiver, reached via its in-cluster
+  # Service (agents.enabled by the DatadogAgent CR create one named
+  # `datadog-agent` in the `datadog` namespace once OTLP is enabled --
+  # see deploy/kubernetes/telemetry/README.md). Setting only the combined
+  # OTEL_EXPORTER_OTLP_ENDPOINT (rather than separate _TRACES_/_METRICS_
+  # variants) sends both signals to the same receiver, which is exactly
+  # what one Agent's OTLP ingestion is for.
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://datadog-agent.datadog.svc.cluster.local:4317"
+  # internal/telemetry's Resource is built with resource.WithFromEnv(),
+  # which is what reads this -- the standard OTel mechanism for
+  # deployment-specific resource attributes, rather than a bespoke
+  # environment variable. This matches the env:dev tag the DatadogAgent
+  # CR's spec.global.tags already applies to infrastructure telemetry, so
+  # application traces/metrics carry the same environment identity.
+  OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=dev"

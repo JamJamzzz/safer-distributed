@@ -37,6 +37,14 @@ spec:
         - name: loadgen
           image: safer-loadgen:local
           imagePullPolicy: IfNotPresent
+          envFrom:
+            # Telemetry-backend configuration, deliberately a separate
+            # ConfigMap -- see deploy/kubernetes/telemetry/otel-config.yaml
+            # and worker-deployment.yaml's matching comment. Optional: its
+            # absence just means no telemetry is exported.
+            - configMapRef:
+                name: safer-otel-config
+                optional: true
           args:
             - "-addr=dns:///safer-worker-headless:50052"
             - "-workload=mixed"
