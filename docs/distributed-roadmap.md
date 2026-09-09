@@ -772,6 +772,144 @@ that the fix works and that the deployment is functionally correct under a worke
 failure; it is not a substitute for a longer soak test, a real multi-node cluster, or
 production capacity planning, none of which this phase attempted.
 
+## OpenTelemetry -> Datadog observability (Phase 5)
+
+Deliberately narrow: `worker`/`coordinator`/`loadgen` export OpenTelemetry traces and
+metrics over OTLP/gRPC to the existing Datadog Agent's OTLP receiver. No OTel
+Collector, no Prometheus/Grafana/Jaeger, no service mesh, no new microservice. The
+application depends only on `go.opentelemetry.io/otel` and its SDK/exporter packages
+(`sdk`, `sdk/metric`, `exporters/otlp/otlptrace/otlptracegrpc`,
+`exporters/otlp/otlpmetric/otlpmetricgrpc`, `contrib.../otelgrpc` @ v1.24.0/v0.49.0,
+chosen to keep `go.mod`'s existing `go 1.20` directive) -- never a Datadog-specific
+tracing library.
+
+### Bootstrap: optional by construction
+
+`internal/telemetry.Setup` is the one place any of the three binaries touch OTel setup.
+It reads the standard `OTEL_EXPORTER_OTLP_ENDPOINT`/`_TRACES_ENDPOINT`/
+`_METRICS_ENDPOINT` variables itself (rather than letting the exporters silently fall
+back to the spec-default `localhost:4317`), builds a `Resource` via
+`resource.WithFromEnv()` plus `service.name`/`service.instance.id`/`service.version`,
+and installs a `TracerProvider`/`MeterProvider` with a bounded (5s) shutdown. If no
+endpoint is configured, `Setup` does nothing and returns a no-op shutdown -- OTel's own
+global no-op Tracer/Meter stays installed, so every instrumentation call site below is
+unconditionally safe whether or not telemetry is turned on anywhere. `internal/telemetry_test.go`
+proves both paths: disabled-by-default with no endpoint, and a real
+`*sdktrace.TracerProvider` installed (with bounded shutdown against an unreachable
+backend) when one is set.
+
+### Tracing on real gRPC boundaries
+
+Every gRPC boundary in the system carries trace context automatically via
+`otelgrpc.NewServerHandler()`/`NewClientHandler()` (the modern `stats.Handler` API):
+worker server, coordinator server, worker-to-coordinator client
+(`client/coordination/grpccoord`), and loadgen-to-worker client (`cmd/loadgen/dial.go`).
+This is what makes a trace follow `loadgen -> worker RPC -> SAFER operation ->
+coordinator Acquire -> MongoDB transaction` as one connected trace rather than four
+disconnected ones. On top of that, manual spans cover the parts automatic RPC tracing
+does not see inside each hop:
+
+- Worker (`cmd/worker/service.go`, `cmd/worker/authlimit.go`): `worker.authenticate`
+  wraps the auth-admission wait plus `GetUserContext`/`InitUserContext`; a
+  `safer.<Operation>` span (`safer.InitUser`, `safer.StoreFile`, `safer.AppendToFile`,
+  `safer.LoadFile`) wraps each handler's actual SAFER call.
+- Coordinator (`client/coordination/grpccoord/server.go`): `coordinator.lock_wait` wraps
+  the real `AcquireContext` wait (not the idempotent-retry fast path) with `lock.mode`/
+  `resource.type` attributes; `coordinator.teardown` wraps lease/lock release with a
+  `grants_count` attribute.
+- Storage (`client/storage/mongostore/atomic.go`): `mongostore.run_atomic` wraps the
+  whole atomic transaction boundary, recording a `mongostore.outcome`
+  (`committed`/`error`) attribute and the error itself on failure.
+
+No span anywhere carries a password, plaintext file content, a derived key, Mongo
+credentials, or a high-cardinality identifier (raw username, filename, FileID, or
+Namespace key) -- `resourceTypeLabel` maps lock resources down to `"namespace"`/
+`"file"`/`"unknown"` before it ever becomes a span attribute, matching the same
+trust-boundary reasoning Phase 4.5 applied to the worker gRPC channel.
+
+### Metrics
+
+| Metric | Kind | Attributes | Question it answers |
+|---|---|---|---|
+| `safer.coordinator.lock.acquire.count` | counter | `lock.mode`, `resource.type`, `outcome` | lock contention volume |
+| `safer.coordinator.lock.wait.duration` | histogram (s) | `lock.mode`, `resource.type`, `outcome` | how long callers actually wait for a lock |
+| `safer.worker.auth_admission.wait.duration` | histogram (s) | `outcome` | authLimiter queueing delay |
+| `safer.worker.auth_admission.in_flight` | up-down counter | -- | live auth-admission saturation |
+| `safer.coordinator.lease.revocation.count` | counter | -- | stale-lease revocations |
+| `safer.coordinator.fence.cleanup.retry.count` | counter | -- | fence cleanup retry pressure |
+| `safer.coordinator.fence.cleanup.failure.count` | counter | -- | fence cleanup giving up |
+| `safer.storage.transaction.duration` | histogram (s) | `outcome` | Mongo atomic transaction time |
+| `safer.storage.fence.rejection.count` | counter | -- | stale-fence rejections inside storage |
+
+`outcome` values are deliberately small, fixed enums (`granted`/`caller_cancelled`/
+`revoked`/`failed`, `acquired`/`cancelled`, `committed`/`error`), never a raw error
+string or identifier.
+
+### Logging
+
+No custom logging framework was added; the existing `log.Printf`-based output from
+each binary is left as-is and picked up by the Datadog Agent's standard container log
+collection. Trace/span-ID log correlation was **not** implemented -- doing it properly
+means routing every log line through a context-aware logger, which none of the three
+binaries have today, and retrofitting one was judged out of this phase's narrow scope.
+
+### Datadog Agent: inspected, not reinstalled
+
+The already-running Datadog Operator/Cluster Agent/node Agent in the `datadog`
+namespace of the `safer-test` kind cluster (site `us3.datadoghq.com`, `env:dev`) was
+never reinstalled. `kubectl -n datadog get datadogagent datadog -o yaml` showed no
+`otlp:` block under `spec.features`, confirming OTLP ingestion was genuinely not yet
+enabled despite infrastructure telemetry already working -- the CR was not assumed
+either way. The only change made was a `kubectl patch --type merge` adding
+`spec.features.otlp.receiver.protocols.grpc.enabled: true`; every other field (the
+`datadog-secret` API-key reference, `clusterName`, `site`, `env:dev` tag,
+`kubelet.tlsVerify: false`, APM instrumentation, cluster checks) was confirmed
+byte-for-byte unchanged by diffing the full CR before and after. The Agent rolled and
+returned to `Running (1/1/1)`. See `deploy/kubernetes/telemetry/README.md` for the
+exact commands. `deploy/kubernetes/telemetry/otel-config.yaml` is a separate,
+optionally-referenced ConfigMap pointing `OTEL_EXPORTER_OTLP_ENDPOINT` at the Agent's
+in-cluster Service (`datadog-agent.datadog.svc.cluster.local:4317`) -- deliberately
+kept out of SAFER's own `configmap.yaml`, the same separation-of-concerns choice
+already made for MongoDB.
+
+### Evidence gathered locally
+
+Both workloads run against the same live `kind` cluster, worker/coordinator images
+rebuilt with the Phase 5 instrumentation, `safer-otel-config` applied, Deployments
+restarted:
+
+- `mixed`: `attempted=200 succeeded=200 failed=0`, `replicas_served=3` (72/71/73).
+- `same-file-writes` (`-concurrency=8 -count=200`): `attempted=200 succeeded=200
+  failed=0`, `replicas_served=3` (67/68/67).
+- Zero worker restarts across both runs (`kubectl get pods -l app=safer-worker` showed
+  `RESTARTS: 0` throughout); no `DATA CORRUPTION` or `VERIFICATION ERROR` from either
+  run's oracle checks; no export errors or panics in worker/coordinator pod logs.
+- `agent status` inside the Agent pod shows `OTLP: Status: Enabled, Collector status:
+  Running`, and the `datadog-agent` Service exposes `4317/TCP` alongside its existing
+  `8126/TCP,8125/UDP`.
+- The trace-agent's own per-minute stats (`agent status`'s "APM Agent" section) show
+  direct, repeated correlation with the exact traffic generated: the priority-sampling
+  rate for `service:safer-loadgen,env:dev` (a stat the trace-agent computes only from
+  traces it has actually received and processed for that service) changed value after
+  each fresh run in this session (69.4% -> 89.3% -> 80.6%), and the "Writer (previous
+  minute)" stats-payload counters were non-zero immediately after a run. This is local,
+  Agent-side evidence that OTLP-derived trace data tagged with this repository's exact
+  service names is reaching and being processed by the Agent. It is not the same as
+  visually confirming traces, metrics, and logs in the Datadog UI -- that verification
+  is manual and belongs to whoever has access to it, not something this repository can
+  fabricate. See the corresponding session handoff for the exact service names, span
+  names, metric names, and log filters to check.
+
+### What Phase 5 does not attempt
+
+No log/trace correlation (noted above). No answer yet to the "same-file-writes latency
+breakdown" question Phase 5 set out to use telemetry for: the actual observed
+`safer.coordinator.lock.wait.duration`, `safer.worker.auth_admission.wait.duration`,
+and `safer.storage.transaction.duration` values only exist in Datadog once ingested,
+and reading them back needs Datadog UI or API access this repository's automation does
+not have and must not acquire on its own (the plaintext Datadog API key is explicitly
+off-limits). That analysis is deferred until those numbers are reported back.
+
 ## Claims not yet earned
 
 Recorded here so they are not asserted prematurely:
@@ -840,7 +978,12 @@ Recorded here so they are not asserted prematurely:
   *what* an already-allowed pod sends. The worker gRPC surface is explicitly not
   suitable for exposure to an untrusted network as a result. Building mTLS or another
   service-authentication layer remains out of scope for this phase.
-- **No production sizing.** The CPU/memory requests and limits in
-  `deploy/kubernetes/` are conservative development defaults, not derived from any
-  load test. `cmd/loadgen` validates functional correctness under concurrency in this
-  phase, not throughput or capacity.
+- **No production sizing.** Most CPU/memory requests and limits in `deploy/kubernetes/`
+  remain conservative development defaults, not derived from any load test -- this is
+  still true of the coordinator's and loadgen's, and of every CPU request/limit in this
+  repository. The worker's *memory* request/limit is the one exception: Phase 4.6
+  re-derived it directly from the OOM measurements above ("Kubernetes memory limit,
+  re-derived from evidence"), so it is evidence-informed rather than an unverified
+  guess. Neither status is production capacity planning, which needs a longer,
+  multi-node soak-test regime this repository has not run. `cmd/loadgen` validates
+  functional correctness under concurrency in this phase, not throughput or capacity.
