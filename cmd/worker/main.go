@@ -76,15 +76,18 @@ func main() {
 func run(cfg Config) error {
 	ctx := context.Background()
 
-	// Telemetry is optional (see internal/telemetry's package doc): with
-	// no OTEL_EXPORTER_OTLP_* endpoint configured, Setup does nothing and
-	// shutdownTelemetry is a no-op. Registered before the other deferred
-	// cleanups below, so it runs last -- flushing whatever telemetry the
-	// run produced only after everything else has already shut down.
-	shutdownTelemetry, err := telemetry.Setup(ctx, telemetry.Config{ServiceName: "safer-worker"})
-	if err != nil {
-		return fmt.Errorf("telemetry setup: %w", err)
-	}
+	// Telemetry is optional (see internal/telemetry's package doc) and
+	// fails OPEN, never closed: a malformed or unreachable OTLP
+	// configuration is an observability problem, not a reason to refuse
+	// to serve SAFER traffic. setupTelemetry logs any Setup failure as a
+	// warning and returns a safe no-op shutdown instead of propagating
+	// the error -- unlike the MongoDB/coordinator dependencies below,
+	// which fail this startup closed on purpose, because SAFER cannot
+	// actually do anything useful without them. Registered before the
+	// other deferred cleanups below, so it runs last -- flushing whatever
+	// telemetry the run produced only after everything else has already
+	// shut down.
+	shutdownTelemetry := setupTelemetry(ctx, telemetry.Config{ServiceName: "safer-worker"})
 	defer func() {
 		if err := shutdownTelemetry(context.Background()); err != nil {
 			log.Printf("worker: flushing telemetry: %v", err)
@@ -198,4 +201,22 @@ func shutdown(grpcServer *grpc.Server, healthServer *health.Server, shutdownTime
 		grpcServer.Stop()
 		<-stopped
 	}
+}
+
+// setupTelemetry wraps telemetry.Setup with this binary's fail-open
+// policy: telemetry is an optional add-on (see internal/telemetry's
+// package doc), so a malformed OTEL_EXPORTER_OTLP_* configuration, or a
+// backend that Setup cannot reach while constructing itself, must never
+// stop this worker from serving SAFER traffic. Any Setup error is logged
+// clearly -- it is not hidden -- and this returns a safe no-op Shutdown
+// in its place; internal/telemetry.Setup itself guarantees that a failed
+// call never leaves a real TracerProvider/MeterProvider installed for a
+// caller in this position to worry about.
+func setupTelemetry(ctx context.Context, cfg telemetry.Config) telemetry.Shutdown {
+	shutdownTelemetry, err := telemetry.Setup(ctx, cfg)
+	if err != nil {
+		log.Printf("worker: telemetry setup failed, continuing with telemetry disabled: %v", err)
+		return func(context.Context) error { return nil }
+	}
+	return shutdownTelemetry
 }

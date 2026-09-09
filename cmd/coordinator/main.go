@@ -54,17 +54,17 @@ func main() {
 
 // run starts the coordinator and serves until it is asked to stop.
 func run(cfg Config) error {
-	// Telemetry is optional (see internal/telemetry's package doc): with
-	// no OTEL_EXPORTER_OTLP_* endpoint configured, Setup does nothing and
-	// shutdownTelemetry is a no-op, so a coordinator with no observability
-	// backend configured behaves exactly as it did before Phase 5.
+	// Telemetry is optional (see internal/telemetry's package doc) and
+	// fails OPEN, never closed: a malformed or unreachable OTLP
+	// configuration is an observability problem, not a reason to refuse
+	// to coordinate SAFER locks. setupTelemetry logs any Setup failure as
+	// a warning and returns a safe no-op shutdown instead of propagating
+	// the error -- unlike the fence-store dependency below, which fails
+	// this startup closed on purpose (see this file's own package doc).
 	// Registered before the other deferred cleanups below, so it runs
 	// last -- flushing whatever telemetry the run produced only after
 	// everything else has already shut down.
-	shutdownTelemetry, err := telemetry.Setup(context.Background(), telemetry.Config{ServiceName: "safer-coordinator"})
-	if err != nil {
-		return fmt.Errorf("telemetry setup: %w", err)
-	}
+	shutdownTelemetry := setupTelemetry(context.Background(), telemetry.Config{ServiceName: "safer-coordinator"})
 	defer func() {
 		if err := shutdownTelemetry(context.Background()); err != nil {
 			log.Printf("coordinator: flushing telemetry: %v", err)
@@ -187,4 +187,22 @@ func openFenceStore(cfg Config) (fences grpccoord.FenceStore, closeFn func(), er
 
 	log.Printf("coordinator: fencing enabled, using database %q", mongoCfg.Database)
 	return store, func() { _ = store.Close(context.Background()) }, nil
+}
+
+// setupTelemetry wraps telemetry.Setup with this binary's fail-open
+// policy: telemetry is an optional add-on (see internal/telemetry's
+// package doc), so a malformed OTEL_EXPORTER_OTLP_* configuration, or a
+// backend that Setup cannot reach while constructing itself, must never
+// stop this coordinator from serving lock requests. Any Setup error is
+// logged clearly -- it is not hidden -- and this returns a safe no-op
+// Shutdown in its place; internal/telemetry.Setup itself guarantees that
+// a failed call never leaves a real TracerProvider/MeterProvider
+// installed for a caller in this position to worry about.
+func setupTelemetry(ctx context.Context, cfg telemetry.Config) telemetry.Shutdown {
+	shutdownTelemetry, err := telemetry.Setup(ctx, cfg)
+	if err != nil {
+		log.Printf("coordinator: telemetry setup failed, continuing with telemetry disabled: %v", err)
+		return func(context.Context) error { return nil }
+	}
+	return shutdownTelemetry
 }

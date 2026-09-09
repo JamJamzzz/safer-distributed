@@ -112,34 +112,64 @@ func Setup(ctx context.Context, cfg Config) (Shutdown, error) {
 		return noopShutdown, fmt.Errorf("telemetry: building resource: %w", err)
 	}
 
-	var shutdownFuncs []func(context.Context) error
+	// Setup is transactional from here on: every exporter this
+	// configuration calls for is constructed first, and none of them is
+	// installed as a global provider until all of them have succeeded.
+	// Without this, a config that enables both traces and metrics but
+	// fails only the second exporter would otherwise leave a real
+	// TracerProvider installed globally while Setup itself returns an
+	// error -- callers that treat a non-nil error as "telemetry is off"
+	// would then be wrong, and the half-installed TracerProvider would
+	// never be shut down by anything.
 
+	// otlptracegrpc.New/otlpmetricgrpc.New read OTEL_EXPORTER_OTLP_(TRACES_/METRICS_)*
+	// themselves (endpoint, headers, compression, TLS) for anything not
+	// passed as an explicit option; nothing about the endpoint is
+	// hard-coded here. The gRPC connections they open are non-blocking by
+	// default, so a misconfigured or unreachable backend does not delay
+	// these calls or, later, the request path.
+	var traceExporter sdktrace.SpanExporter
 	if tracesEndpoint != "" {
-		// otlptracegrpc.New reads OTEL_EXPORTER_OTLP_(TRACES_)* itself
-		// (endpoint, headers, compression, TLS) for anything not passed
-		// as an explicit option; nothing about the endpoint is
-		// hard-coded here. The gRPC connection it opens is non-blocking
-		// by default, so a misconfigured or unreachable backend does not
-		// delay this call or, later, the request path.
-		exporter, err := otlptracegrpc.New(ctx)
+		traceExporter, err = otlptracegrpc.New(ctx)
 		if err != nil {
 			return noopShutdown, fmt.Errorf("telemetry: creating trace exporter: %w", err)
 		}
+	}
+
+	var metricExporter metric.Exporter
+	if metricsEndpoint != "" {
+		metricExporter, err = otlpmetricgrpc.New(ctx)
+		if err != nil {
+			// The trace exporter above, if any, was never installed
+			// anywhere -- nothing else can hold a reference to it, so
+			// this is the only chance to release whatever it already
+			// allocated (a gRPC ClientConn and its background
+			// goroutines) rather than leaking it silently.
+			if traceExporter != nil {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				_ = traceExporter.Shutdown(shutdownCtx)
+				cancel()
+			}
+			return noopShutdown, fmt.Errorf("telemetry: creating metric exporter: %w", err)
+		}
+	}
+
+	// Every exporter this configuration asked for now exists. Only past
+	// this point does Setup touch OpenTelemetry's global state, so a
+	// caller that received an error above never also observes a real
+	// provider installed.
+	var shutdownFuncs []func(context.Context) error
+	if traceExporter != nil {
 		tp := sdktrace.NewTracerProvider(
-			sdktrace.WithBatcher(exporter),
+			sdktrace.WithBatcher(traceExporter),
 			sdktrace.WithResource(res),
 		)
 		otel.SetTracerProvider(tp)
 		shutdownFuncs = append(shutdownFuncs, tp.Shutdown)
 	}
-
-	if metricsEndpoint != "" {
-		exporter, err := otlpmetricgrpc.New(ctx)
-		if err != nil {
-			return noopShutdown, fmt.Errorf("telemetry: creating metric exporter: %w", err)
-		}
+	if metricExporter != nil {
 		mp := metric.NewMeterProvider(
-			metric.WithReader(metric.NewPeriodicReader(exporter)),
+			metric.WithReader(metric.NewPeriodicReader(metricExporter)),
 			metric.WithResource(res),
 		)
 		otel.SetMeterProvider(mp)
